@@ -1,0 +1,221 @@
+# -*- indent-tabs-mode: nil -*-
+
+variables:
+  # Container(OCI) images for various distros and architectures and compilers
+
+  AMD64_FEDORA_LATEST:       "registry.gitlab.gnome.org/gnome/librsvg-oci-images/amd64/fedora:latest"
+  AMD64_FEDORA_RAWHIDE:      "registry.gitlab.gnome.org/gnome/librsvg-oci-images/amd64/fedora:rawhide"
+  AMD64_OPENSUSE_TUMBLEWEED: "registry.gitlab.gnome.org/gnome/librsvg-oci-images/amd64/opensuse:tumbleweed"
+  AMD64_DEBIAN_TESTING:      "registry.gitlab.gnome.org/gnome/librsvg-oci-images/amd64/debian:testing"
+  AMD64_UBUNTU_BIONIC:       "registry.gitlab.gnome.org/gnome/librsvg-oci-images/amd64/ubuntu:18.04"
+
+  I386_DEBIAN_TESTING:       "registry.gitlab.gnome.org/gnome/librsvg-oci-images/i386/debian:testing"
+  I386_UBUNTU_BIONIC:        "registry.gitlab.gnome.org/gnome/librsvg-oci-images/i386/ubuntu:18.04"
+
+  RUSTC_1_24:                "registry.gitlab.gnome.org/gnome/librsvg-oci-images/rustc:1.24"
+  RUSTC_1_25:                "registry.gitlab.gnome.org/gnome/librsvg-oci-images/rustc:1.25"
+
+  RUSTFMT_NIGHTLY:           "registry.gitlab.com/alatiera/rustfmt-oci-image/rustfmt:nightly"
+  CLIPPY_NIGHTLY:            "registry.gitlab.gnome.org/gnome/librsvg-oci-images/clippy:nightly"
+
+stages:
+  - test
+  - lint
+  - distcheck
+  - rustc
+  - cross_distro
+
+.test_template: &test
+  before_script:
+    # CCache Config
+    - mkdir -p ccache
+    - mkdir -p .cargo_cache
+    - export CCACHE_BASEDIR=${PWD}
+    - export CCACHE_DIR=${PWD}/ccache
+    - export CC="ccache gcc"
+
+    # Only stuff inside the repo directory can be cached
+    # Override the CARGO_HOME variable to force it location
+    - export CARGO_HOME="${PWD}/.cargo_cache"
+  script:
+    - rustc --version && cargo --version
+    - ./autogen.sh --enable-gtk-doc --enable-vala
+    - make check
+
+  artifacts:
+    when: on_failure
+    paths:
+      - tests/*.log
+      - tests/output/
+
+  cache:
+    # JOB_NAME - Each job will have it's own cache
+    # COMMIT_REF_SLUG = Lowercase name of the branch
+    # ^ Keep diffrerent caches for each branch
+    key: "$CI_JOB_NAME-$CI_COMMIT_REF_SLUG"
+    paths:
+      - target/
+      - .cargo_cache/
+      - ccache/
+
+.distro_template: &distro_test
+    stage: cross_distro
+    <<: *test
+
+.rustc_template: &rustc
+    stage: rustc
+    <<: *test
+
+# Jobs that are marked with stage_1 will be run on every commit, across every
+# fork and branch. This only serves as documentation since it's equivelant to
+# ommiting only: key. Thus why stage_1 jobs might not be marked.
+.test_stage_1: &stage_1
+  only: {}
+
+# Jobs that are marked as stage 2 will be run for every commit
+# at GNOME/librsvg/master too. Ideal targets for this stage are
+# debug cross_distro tests, and debug cross_arch tests to avoid
+# breakign i386 and arm builds again.
+.test_stage_2: &stage_2
+  only:
+    # When branching a stable branch,
+    # update the following line from master to branch's name.
+    - librsvg-2.42@GNOME/librsvg
+    - master@GNOME/librsvg
+    - librsvg-2.42
+    - schedules
+    - tags
+    - web
+
+# Jobs that are marked as stage 3 will only run on scheduled pipelines.
+# Ideal targets for this stage are expensive task, that only need to be run
+# on a regular time interval. Ex testing all the gcc/rustc version that we target
+.test_stage_3: &stage_3
+  only:
+    - schedules
+    - tags
+    - web
+
+# STAGE 1 TESTS
+########################################################################
+
+fedora:test:
+  image: $AMD64_FEDORA_LATEST
+  stage: test
+  variables:
+    LIBRSVG_DEBUG: "yes"
+  <<: *test
+
+# STAGE 1 LINTS
+########################################################################
+
+# Configure and run rustfmt on nightly
+# Exits and builds fails on bad format
+rustfmt:
+  image: $RUSTFMT_NIGHTLY
+  stage: lint
+  script:
+    - rustc --version && cargo --version
+    - cargo fmt --version
+    - cargo fmt --all -- --check
+
+
+# Configure and run clippy on nightly
+# Only fails on errors atm.
+clippy:
+  image: $CLIPPY_NIGHTLY
+  stage: lint
+  script:
+    - rustc --version && cargo --version
+    - cargo install clippy --force
+    - cargo clippy --all
+  when: manual
+
+tarball:
+  image: $AMD64_FEDORA_LATEST
+  stage: distcheck
+  variables:
+    LIBRSVG_DEBUG: "yes"
+  script:
+    - rustc --version && cargo --version
+    - ./autogen.sh --enable-gtk-doc --enable-vala
+    - make distcheck DESTDIR=/tmp/distcheck
+  <<: *stage_2
+
+# STAGE 2 CROSS DISTRO TESTS
+#######################################################################
+
+fedora:rawhide:
+  image: $AMD64_FEDORA_RAWHIDE
+  variables:
+    LIBRSVG_DEBUG: "yes"
+  <<: *distro_test
+  <<: *stage_2
+
+opensuse:tumbleweed:
+  image: $AMD64_OPENSUSE_TUMBLEWEED
+  variables:
+    LIBRSVG_DEBUG: "yes"
+  <<: *distro_test
+  <<: *stage_2
+
+debian:testing:
+  image: $AMD64_DEBIAN_TESTING
+  variables:
+    LIBRSVG_DEBUG: "yes"
+  <<: *distro_test
+  <<: *stage_2
+
+ubuntu:18.04:
+  image: $AMD64_UBUNTU_BIONIC
+  <<: *distro_test
+  <<: *stage_2
+
+debian_i386:testing:
+  image: $I386_DEBIAN_TESTING
+  variables:
+    LIBRSVG_DEBUG: "yes"
+  <<: *distro_test
+  <<: *stage_2
+
+ubuntu_i386:18.04:
+  image: $I386_UBUNTU_BIONIC
+  variables:
+    LIBRSVG_DEBUG: "yes"
+  <<: *distro_test
+  <<: *stage_2
+
+# STAGE 3 CROSS DISTRO TESTS
+#######################################################################
+
+fedora:test_release:
+  image: $AMD64_FEDORA_LATEST
+  stage: test
+  variables:
+    LIBRSVG_DEBUG: "no"
+  <<: *distro_test
+  <<: *stage_3
+
+debian:testing_release_i386:
+  image: $I386_DEBIAN_TESTING
+  variables:
+    LIBRSVG_DEBUG: "no"
+  <<: *distro_test
+  <<: *stage_3
+
+# STAGE 3 RUSTC TESTS
+#######################################################################
+
+rustc:1_24:
+  image: $RUSTC_1_24
+  variables:
+    LIBRSVG_DEBUG: "yes"
+  <<: *rustc
+  <<: *stage_3
+
+rustc:1_25:
+  image: $RUSTC_1_25
+  variables:
+    LIBRSVG_DEBUG: "yes"
+  <<: *rustc
+  <<: *stage_3

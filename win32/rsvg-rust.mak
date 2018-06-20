@@ -32,13 +32,13 @@ CARGO_CMD = $(CARGO) build $(CARGO_TARGET) --release
 CARGO_CMD = $(CARGO) build $(CARGO_TARGET)
 !endif
 
-all: vs$(VSVER)\$(CFG)\$(PLAT)\obj\rsvg_internals\$(CFG)\rsvg_internals.lib
+all: vs$(VSVER)\$(CFG)\$(PLAT)\obj\rsvg_internals\$(RUST_TARGET)-pc-windows-msvc\$(CFG)\rsvg_internals.lib
 
-vs$(VSVER)\$(CFG)\$(PLAT)\obj\rsvg_internals\$(CFG)\rsvg_internals.lib:
+vs$(VSVER)\$(CFG)\$(PLAT)\obj\rsvg_internals\$(RUST_TARGET)-pc-windows-msvc\$(CFG)\rsvg_internals.lib:
 	@set CARGO_TARGET_DIR=..\win32\vs$(VSVER)\$(CFG)\$(PLAT)\obj\rsvg_internals
 	@set GTK_LIB_DIR=..\..\vs$(VSVER)\$(PLAT)\lib;$(LIB)
 	$(RUSTUP_CMD)
-	@cd ..\rust
+	@cd ..\rsvg_internals
 	$(CARGO_CMD) --verbose
 	@cd ..\win32\vs$(VSVER)
 	@set GTK_LIB_DIR=
@@ -46,7 +46,7 @@ vs$(VSVER)\$(CFG)\$(PLAT)\obj\rsvg_internals\$(CFG)\rsvg_internals.lib:
 
 clean:
 	@set CARGO_TARGET_DIR=..\win32\vs$(VSVER)\$(CFG)\$(PLAT)\obj\rsvg_internals
-	@cd ..\rust
+	@cd ..\rsvg_internals
 	@$(CARGO) clean
 	@cd ..\win32\vs$(VSVER)
 	@set CARGO_TARGET_DIR=

@@ -1,6 +1,6 @@
 m4_define([rsvg_major_version],[2])
-m4_define([rsvg_minor_version],[41])
-m4_define([rsvg_micro_version],[3])
+m4_define([rsvg_minor_version],[43])
+m4_define([rsvg_micro_version],[1])
 m4_define([rsvg_extra_version],[])
 m4_define([rsvg_version],[rsvg_major_version.rsvg_minor_version.rsvg_micro_version()rsvg_extra_version])
 m4_define([rsvg_lt_version_info],m4_eval(rsvg_major_version + rsvg_minor_version):rsvg_micro_version:rsvg_minor_version)
@@ -8,10 +8,10 @@ m4_define([rsvg_lt_version_info],m4_eval(rsvg_major_version + rsvg_minor_version
 AC_INIT([RSVG],[rsvg_version],[https://gitlab.gnome.org/GNOME/librsvg/issues],[librsvg])
 
 AC_CONFIG_HEADERS([config.h])
-AC_CONFIG_SRCDIR([rsvg.h])
+AC_CONFIG_SRCDIR([librsvg/rsvg.h])
 AC_CONFIG_MACRO_DIR([m4])
 
-AM_INIT_AUTOMAKE([1.9 foreign no-dist-gzip dist-xz])
+AM_INIT_AUTOMAKE([1.9 foreign no-dist-gzip dist-xz tar-ustar subdir-objects])
 m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
 
 AM_MAINTAINER_MODE([enable])
@@ -37,15 +37,18 @@ AC_SUBST([LIBRSVG_MINOR_VERSION],[rsvg_minor_version])
 AC_SUBST([LIBRSVG_MICRO_VERSION],[rsvg_micro_version])
 
 dnl ===========================================================================
+dnl Please update COMPILING.md with version numbers if these change
 
-GLIB_REQUIRED=2.52.0
-GIO_REQUIRED=2.24.0
-LIBXML_REQUIRED=2.9.0
-CAIRO_REQUIRED=1.2.0
-PANGO_REQUIRED=1.38.0
-GDK_PIXBUF_REQUIRED=2.20
-GTK3_REQUIRED=3.10.0
+CAIRO_REQUIRED=1.15.4
 CROCO_REQUIRED=0.6.1
+dnl This corresponds to Freetype2 2.8
+FREETYPE2_REQUIRED=20.0.14
+GDK_PIXBUF_REQUIRED=2.20
+GIO_REQUIRED=2.24.0
+GLIB_REQUIRED=2.48.0
+GTK3_REQUIRED=3.10.0
+LIBXML_REQUIRED=2.9.0
+PANGO_REQUIRED=1.38.0
 
 dnl ===========================================================================
 
@@ -64,6 +67,11 @@ PKG_PROG_PKG_CONFIG
 LT_INIT([win32-dll])
 LT_LIB_M
 
+# Check if -ldl is needed to use dlopen()
+AC_CHECK_FUNC(dlopen, [],
+              [AC_CHECK_LIB(dl, dlopen, [DLOPEN_LIBS=-ldl])])
+AC_SUBST(DLOPEN_LIBS)
+
 dnl ===========================================================================
 
 AC_CHECK_PROG(CARGO, [cargo], [yes], [no])
@@ -73,6 +81,20 @@ AS_IF(test x$CARGO = xno,
 AC_CHECK_PROG(RUSTC, [rustc], [yes], [no])
 AS_IF(test x$RUSTC = xno,
     AC_MSG_ERROR([rustc is required.  Please install the Rust toolchain from https://www.rust-lang.org/])
+)
+
+dnl Minimum version of rustc that we support
+dnl If you change this, please update COMPILING.md
+MINIMUM_RUST_MAJOR=1
+MINIMUM_RUST_MINOR=24
+
+rust_version=`rustc --version`
+version=`echo "$rust_version" | sed -e 's/^rustc //g'`
+major=`echo "$version" | cut -d. -f1`
+minor=`echo "$version" | cut -d. -f2`
+
+AS_IF(test "$major" -lt "$MINIMUM_RUST_MAJOR" -o "$minor" -lt "$MINIMUM_RUST_MINOR",
+    AC_MSG_ERROR([librsvg needs at rustc version at least $MINIMUM_RUST_MAJOR.$MINIMUM_RUST_MINOR])
 )
 
 dnl ===========================================================================
@@ -108,15 +130,16 @@ dnl ===========================================================================
 GLIB_MKENUMS=`$PKG_CONFIG --variable=glib_mkenums glib-2.0`
 AC_SUBST(GLIB_MKENUMS)
 
-PKG_CHECK_MODULES(LIBRSVG, \
+PKG_CHECK_MODULES(LIBRSVG,                     \
+	cairo >= $CAIRO_REQUIRED               \
+	cairo-png >= $CAIRO_REQUIRED           \
+	freetype2 >= $FREETYPE2_REQUIRED       \
 	gdk-pixbuf-2.0 >= $GDK_PIXBUF_REQUIRED \
-	glib-2.0 >= $GLIB_REQUIRED \
-	gio-2.0 >= $GIO_REQUIRED \
-	libxml-2.0 >= $LIBXML_REQUIRED \
-	pangocairo >= $PANGO_REQUIRED \
-	pangoft2 >= $PANGO_REQUIRED \
-	cairo >= $CAIRO_REQUIRED \
-	cairo-png >= $CAIRO_REQUIRED
+	gio-2.0 >= $GIO_REQUIRED               \
+	glib-2.0 >= $GLIB_REQUIRED             \
+	libxml-2.0 >= $LIBXML_REQUIRED         \
+	pangocairo >= $PANGO_REQUIRED          \
+	pangoft2 >= $PANGO_REQUIRED            \
         libcroco-0.6 >= $CROCO_REQUIRED)
 
 PKG_CHECK_MODULES([GTHREAD],[gthread-2.0 >= $GLIB_REQUIRED])
@@ -133,10 +156,6 @@ case "$host" in
 esac
 
 GLIB_TESTS
-
-dnl ===========================================================================
-
-AC_CHECK_FUNCS(strtok_r)
 
 # ===========================================================================
 # GTK
@@ -196,7 +215,7 @@ AM_CONDITIONAL([ENABLE_PIXBUF_LOADER],[test "$enable_pixbuf_loader" = "yes"])
 AC_ARG_ENABLE([Bsymbolic],
   [AS_HELP_STRING([--disable-Bsymbolic],
                   [disable linking with -Bsymbolic])],
-  [],[enable_Bsymbolic=yes])
+  [enable_Bsymbolic=no],[enable_Bsymbolic=auto])
 
 BSYMBOLIC_LDFLAG=
 if test "$enable_Bsymbolic" != "no"; then
@@ -248,7 +267,15 @@ AC_ARG_ENABLE(debug,
               AC_HELP_STRING([--enable-debug],
                              [Build Rust code with debugging information [default=no]]),
               [debug_release=$enableval],
-	      [debug_release=no])
+	      [
+	        if test "x$LIBRSVG_DEBUG" == "x"; then
+		  debug_release="no"
+		elif test "x$LIBRSVG_DEBUG" = "xyes"; then
+		  debug_release="yes"
+		elif test "x$LIBRSVG_DEBUG" = "xno"; then
+		  debug_release="no"
+		fi
+	      ])
 
 AC_MSG_CHECKING(whether to build Rust code with debugging information)
 if test "x$debug_release" = "xyes" ; then
@@ -260,9 +287,14 @@ else
 fi
 AM_CONDITIONAL([DEBUG_RELEASE], [test "x$debug_release" = "xyes"])
 
+AC_ARG_VAR(RUST_TARGET, [Set rust target (default=$host)])
+if test "x$RUST_TARGET" == x; then
+	RUST_TARGET=$host
+fi
+
 AM_CONDITIONAL(CROSS_COMPILING, test $cross_compiling = yes)
 if test "x$cross_compiling" = "xyes" ; then
-	RUST_TARGET_SUBDIR="$host/$RUST_TARGET_SUBDIR"
+	RUST_TARGET_SUBDIR="$RUST_TARGET/$RUST_TARGET_SUBDIR"
 fi
 AC_SUBST([RUST_TARGET_SUBDIR])
 
@@ -327,7 +359,7 @@ AC_SUBST([AM_CFLAGS])
 AC_SUBST([AM_LDFLAGS])
 
 AC_CONFIG_FILES([
-librsvg-features.h
+librsvg/librsvg-features.h
 Makefile
 librsvg-zip
 gdk-pixbuf-loader/Makefile
@@ -353,7 +385,8 @@ echo "
 librsvg-$VERSION
 
 	prefix:                         ${prefix}
-	compiler:                       ${CC}
+	C compiler:                     ${CC}
+	rustc:                          ${rust_version}
 
         Debugging information for Rust: ${debug_release}
 
@@ -362,4 +395,5 @@ librsvg-$VERSION
 	Build GdkPixbuf loader:         ${enable_pixbuf_loader}
         GTK+ $GTK3_REQUIRED or later:           ${have_gtk_3}
 	Build miscellaneous tools:      ${build_misc_tools}
+	Build HTML documentation:       ${enable_gtk_doc}
 "

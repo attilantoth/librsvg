@@ -1,5 +1,8 @@
+*~
+ChangeLog
 Makefile
 Makefile.in
+TAGS
 aclocal.m4
 autom4te.cache
 compile
@@ -24,6 +27,7 @@ rsvg-view-3
 s-enum-types-c
 s-enum-types-h
 stamp-h1
+test-driver
 test-performance
 *.pc
 *.stamp
@@ -56,10 +60,14 @@ gdk-pixbuf-loader/rsvg-loader
 rust/*~
 rust/src/*~
 rust/src/parse_transform.rs
+target/
 tests/dimensions
 tests/pdiff/perceptualdiff
-tests/rsvg-test
+tests/api
 tests/crash
+tests/loading
+tests/render-crash
+tests/rsvg-test
 tests/styles
 tests/*.log
 tests/*.trs
@@ -69,3 +77,4 @@ Rsvg-2.0.typelib
 librsvg-2.0.vapi
 librsvg-*.tar.xz
 librsvg-*.tar.bz2
+rust/target

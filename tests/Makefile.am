@@ -4,6 +4,7 @@ EXTRA_DIST +=		\
 	README.md
 
 test_programs =		\
+	api		\
 	loading		\
 	rsvg-test	\
 	crash		\
@@ -15,6 +16,10 @@ test_programs =		\
 test_utils_common_sources = \
 	test-utils.c	\
 	test-utils.h
+
+api_SOURCES = 		\
+	api.c		\
+	$(test_utils_common_sources)
 
 rsvg_test_SOURCES = \
 	rsvg-test.c	\
@@ -28,9 +33,9 @@ render_crash_SOURCES = \
 	render-crash.c	\
 	$(test_utils_common_sources)
 
-styles_SOURCES = \
-	styles.c	\
-	$(test_utils_common_sources)
+# styles_SOURCES = \
+# 	styles.c	\
+# 	$(test_utils_common_sources)
 
 dimensions_SOURCES = \
 	dimensions.c	\
@@ -44,15 +49,18 @@ LDADD = $(top_builddir)/librsvg-@RSVG_API_MAJOR_VERSION@.la		\
 	$(LIBRSVG_LIBS)							\
 	$(LIBM)
 
-INCLUDES = -I$(srcdir) 							\
-	   -I$(top_srcdir)						\
-	   -DTEST_DATA_DIR="\"$(srcdir)\""				\
-	   -DTEST_SRC_DIR="\"$(PWD)\""					\
-	   -DTOP_SRC_DIR="\"$(top_srcdir)\""				\
-	  $(LIBRSVG_CFLAGS)
+AM_CPPFLAGS =					\
+	-I$(srcdir) 				\
+	-I$(top_srcdir)				\
+	-I$(top_builddir)/librsvg		\
+	-DTEST_DATA_DIR="\"$(srcdir)\""		\
+	-DTEST_SRC_DIR="\"$(PWD)\""		\
+	-DTOP_SRC_DIR="\"$(top_srcdir)\""	\
+	$(LIBRSVG_CFLAGS)
 
 dist_installed_test_data =						\
 	$(wildcard $(srcdir)/resources/*)				\
+	$(wildcard $(srcdir)/fixtures/api/*.svg)			\
 	$(wildcard $(srcdir)/fixtures/crash/*.svg)			\
 	$(wildcard $(srcdir)/fixtures/crash/*.png)			\
 	$(wildcard $(srcdir)/fixtures/loading/*)			\
@@ -62,6 +70,7 @@ dist_installed_test_data =						\
 	$(wildcard $(srcdir)/fixtures/reftests/bugs/*.png)		\
 	$(wildcard $(srcdir)/fixtures/reftests/svg1.1/*.svg)		\
 	$(wildcard $(srcdir)/fixtures/reftests/svg1.1/*.png)		\
+	$(wildcard $(srcdir)/fixtures/reftests/svg1.1/images/*)		\
 	$(wildcard $(srcdir)/fixtures/reftests/svg1.1/resources/*)	\
 	$(wildcard $(srcdir)/fixtures/render-crash/*.svg)		\
 	fixtures/dimensions/bug564527.svg				\
@@ -80,3 +89,6 @@ dist_installed_test_data =						\
 	fixtures/styles/bug614643.svg					\
 	fixtures/styles/bug418823.svg					\
 	fixtures/styles/order.svg
+
+clean-local:
+	rm -rf output

@@ -1,0 +1,65 @@
+[package]
+name = "rsvg_internals"
+version = "0.0.1"
+authors = ["Federico Mena Quintero <federico@gnome.org>"]
+workspace = "../"
+build = "build.rs"
+
+# IMPORTANT: If you add/remove/update dependencies here, please also
+# update Cargo.toml in https://gitlab.com/BuildStream/cargo-fetcher
+# (just submit a merge request there).
+#
+# BuildStream/cargo-fetcher lets GNOME's BuildStream continuous build
+# service know which dependencies are required.
+#
+# Please update your dependencies here, then run "cargo update" to
+# regenerate librsvg/Cargo.lock, and copy the resolved version numbers
+# from there into cargo-fetcher/Cargo.toml.
+
+[build-dependencies]
+phf_codegen = "0.7.21"
+
+[dependencies]
+libc = "0.2"
+downcast-rs = "^1.0.0"
+regex = "^0.2.1"
+itertools = "0.7.4"
+pango = "0.4"
+pangocairo = "0.5"
+pango-sys = "0.6"
+pangocairo-sys = "0.7"
+cssparser = "0.23"
+lazy_static = "1.0.0"
+phf = "0.7.21"
+float-cmp = "0.4.0"
+
+[dependencies.cairo-sys-rs]
+version = "0.6"
+#git = "https://github.com/gtk-rs/cairo.git"
+#branch = "master"
+#git = "https://github.com/federicomenaquintero/cairo.git"
+#branch = "matrix-try-invert"
+#git = "file:///home/federico/src/gtk-rs/cairo"
+#features = ["png"]
+
+[dependencies.cairo-rs]
+version = "0.4"
+#git = "https://github.com/gtk-rs/cairo.git"
+#branch = "master"
+#git = "file:///home/federico/src/gtk-rs/cairo"
+#features = ["png"]
+
+[dependencies.glib]
+version = "0.5"
+#git = "https://github.com/gtk-rs/glib.git"
+#branch = "master"
+
+[dependencies.glib-sys]
+version = "0.6"
+#git = "https://github.com/gtk-rs/sys"
+#branch = "master"
+
+[lib]
+name = "rsvg_internals"
+crate-type = ["staticlib", "lib"]
+

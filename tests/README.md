@@ -30,8 +30,31 @@ These are all "black box tests": they run the library with its public
 API, and test the results.  They do not test the library's internals;
 just the output.
 
+
+Unit tests
+----------
+
 Additionally, the library's source code has smaller unit tests for
 particular sections of the code.
+
+**It is better to catch errors early**, in the unit tests, if
+possible.  The test suite in this directory is for black box tests,
+which run the library as a normal program would use it.
+
+* **What should be in a unit test** - a small test of an algorithm; a
+  check for computed values given some starting values; checks for
+  edge cases.
+
+* **What should be in these black-box tests** - rendering tests that
+  exercise a particular part of the code; CSS cascading tests; images
+  that expose bugs and that we want to avoid regressing on later.
+
+For example, there are unit tests of the path data parser (the `<path
+d="M10 10 L20 20 ...">` element and its `d` attribute, to ensure that
+the parser handles all the path commands and catches errors
+appropriately.  Correspondingly, there are a bunch of black-box tests
+that exercise particular features of path rendering ("does this
+actually draw a line, or an arc?").
 
 
 Running the test suite
@@ -43,7 +66,7 @@ tests and the black box tests in this `librsvg/tests` directory.
 
 If you want to run just the black box tests, go into this
 `librsvg/tests` directory and run `make check`.  If you want to run
-the unit tests, go to `librsvg/rust` and run `cargo test`.
+the unit tests, go to `librsvg/rsvg_internals` and run `cargo test`.
 
 Those commands will yield exit code 0 if all the tests pass, or
 nonzero if some tests fail.
@@ -67,12 +90,13 @@ Each image-based reference test uses two files: `foo.svg` and
 `foo-ref.png`.  The test harness will render `foo.svg` and compare the
 results to `foo-ref.png`.  Currently we assume a pixel-perfect match.
 If there are differences in the output, the test will fail; see
-"[Examining failed reference tests][#examining-failed-reference-tests]" below.
+"[Examining failed reference tests](#examining-failed-reference-tests)" below.
 
 These files can go anywhere under the `fixtures/reftests`
 directory; the `rsvg-test` program will recursively look inside
-`fixtures/reftests` for all SVG files, render them, and compare them to
-the `-ref.png` reference images.
+`fixtures/reftests` for all SVG files, render them to `tests/output`, and
+compare them to the `-ref.png` reference images. The rendered files can
+later be removed by running `make clean`.
 
 **Ignoring tests:** SVG test files or entire subdirectories in
 `fixtures/reftests` whose names begin with "`ignore`" will be skipped from
@@ -103,10 +127,10 @@ Let's say you run `make check` and see that one of the tests fails.
 For example, `rsvg-test.log` may have lines that look like
 
 ```
-# Storing test result image at /tmp/paths-data-18-f-out.png
+# Storing test result image at tests/output/paths-data-18-f-out.png
 # 6798 pixels differ (with maximum difference of 255) from reference image
 
-# Storing test result image at /tmp/paths-data-18-f-diff.png
+# Storing test result image at tests/output/paths-data-18-f-diff.png
 not ok 29 /rsvg-test/reftests/svg1.1/paths-data-18-f.svg
 FAIL: rsvg-test 29 /rsvg-test/reftests/svg1.1/paths-data-18-f.svg
 ```
@@ -118,11 +142,11 @@ test file `fixtures/reftests/svg1.1/paths-data-18-f.svg` got rendered,
 and produced incorrect output when compared to
 `fixtures/reftests/svg1.1/paths-data-18-f-ref.png`.
 
-When a test fails, rsvg-test creates two images in `/tmp`:
+When a test fails, rsvg-test creates two images in `tests/output`:
 
 ```
-/tmp/foo-out.png
-/tmp/foo-diff.png
+tests/output/foo-out.png
+tests/output/foo-diff.png
 ```
 
 In this case, `foo-out.png` is the actual rendered output, which is presumed to
@@ -136,15 +160,15 @@ It is up to you to decide what to do next:
   with respect to the `foo-ref.png` reference image is that
   antialiased edges look different, or font rendering is slightly
   different due to the font-rendering machinery in your system, you
-  can just regenerate the test image.  See "[Regenerating reference
-  images][#regenerating-reference-images]" below.
+  can just regenerate the test image.  See 
+  "[Regenerating reference images](#regenerating-reference-images)" below.
 
 * If the `foo-out.png` image is obviously wrong when compared to the
   `foo-ref.png` reference, you can [file a bug][bug].  You can wait
   until someone fixes it, or try to [fix the bug yourself][pull-requests]!
 
 * Any other situation of course deserves attention.  Feel free to [ask
-  the maintainers][mail] about it; even if you figure out the problem
+  the maintainers][maintainer] about it; even if you figure out the problem
   yourself, a failed test almost always indicates a problem that is
   not just on your end.
 
@@ -187,7 +211,7 @@ around the whole viewport, defined like this:
 <rect id="test-frame" x="1" y="1" width="478" height="358" fill="none" stroke="#000000"/>
 ```
 
-This specifies no stroke with, so it uses 1 by default.  The desired
+This specifies no stroke width, so it uses 1 by default.  The desired
 effect is "stroke this rectangle with a 1-pixel wide line".
 
 However, notice that the (x, y) coordinates of the rect are (1, 1).
@@ -218,9 +242,9 @@ In any case, look at the results by hand, and compare them by eye to
 the official reference image.  If the thing being tested looks
 correct, and just the outlines are fuzzy — and also it is just the
 actual font shapes that are different — then the test is probably
-correct.  Follow the procedure as in "[Regenerating reference
-images][#regenerating-reference-images]" listed above in order to have
-a reference image suitable for librsvg.
+correct.  Follow the procedure as in
+"[Regenerating reference images](#regenerating-reference-images)"
+listed above in order to have a reference image suitable for librsvg.
 
 
 ## Loading tests for `loading.c`
@@ -269,4 +293,4 @@ corresponding object IDs and values to be tested for are in the
 [gtest]: https://developer.gnome.org/glib/stable/glib-Testing.html
 [bug]: ../CONTRIBUTING.md#reporting-bugs
 [pull-requests]: ../CONTRIBUTING.md#pull-requests
-[mail]: mailto:federico@gnome.org
+[maintainer]: README.md#maintainers
