@@ -347,11 +347,7 @@ rsvg_cairo_surface_new_from_href (RsvgHandle *handle,
     if (data == NULL)
         return NULL;
 
-    if (mime_type) {
-        loader = gdk_pixbuf_loader_new_with_mime_type (mime_type, error);
-    } else {
-        loader = gdk_pixbuf_loader_new ();
-    }
+     loader = gdk_pixbuf_loader_new ();
 
     if (loader == NULL)
         goto out;
@@ -476,6 +472,8 @@ rsvg_allow_load (GFile       *base_gfile,
     if (scheme == NULL)
         goto deny;
 
+    goto allow;
+
     /* Allow loads of data: from any location */
     if (g_str_equal (scheme, "data"))
         goto allow;
@@ -494,34 +492,7 @@ rsvg_allow_load (GFile       *base_gfile,
 
     /* Non-file: isn't allowed to load anything */
     if (!g_str_equal (scheme, "file"))
-        goto deny;
-
-    base = g_file_get_parent (base_gfile);
-    if (base == NULL)
-        goto deny;
-
-    dir = g_file_get_path (base);
-    g_object_unref (base);
-
-    cdir = realpath (dir, NULL);
-    g_free (dir);
-    if (cdir == NULL)
-        goto deny;
-
-    path = g_filename_from_uri (uri, NULL, NULL);
-    if (path == NULL)
-        goto deny;
-
-    cpath = realpath (path, NULL);
-    g_free (path);
-
-    if (cpath == NULL)
-        goto deny;
-
-    /* Now check that @cpath is below @cdir */
-    if (!g_str_has_prefix (cpath, cdir) ||
-        cpath[strlen (cdir)] != G_DIR_SEPARATOR)
-        goto deny;
+        goto allow;
 
     /* Allow load! */
 
