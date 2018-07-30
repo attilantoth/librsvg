@@ -28,11 +28,8 @@
 
 #include "rsvg-attributes.h"
 #include "rsvg-defs.h"
-#include "rsvg-filter.h"
 #include "rsvg-load.h"
-#include "rsvg-structure.h"
 #include "rsvg-styles.h"
-#include "rsvg-xml.h"
 
 typedef enum {
     LOAD_STATE_START,
@@ -42,13 +39,21 @@ typedef enum {
     LOAD_STATE_CLOSED
 } LoadState;
 
-/* Implemented in rust/src/load.rs */
+/* Implemented in rsvg_internals/src/load.rs */
 G_GNUC_INTERNAL
 RsvgNode *rsvg_load_new_node (const char *element_name, RsvgNode *parent, RsvgPropertyBag *atts);
 
-/* Implemented in rust/src/node.rs */
+/* Implemented in rsvg_internals/src/load.rs */
+G_GNUC_INTERNAL
+void rsvg_load_set_node_atts (RsvgHandle *handle, RsvgNode *node, const char *element_name, RsvgPropertyBag atts);
+
+/* Implemented in rsvg_internals/src/node.rs */
 G_GNUC_INTERNAL
 void rsvg_node_register_in_defs(RsvgNode *node, RsvgDefs *defs);
+
+/* Implemented in rsvg_internals/src/structure.rs */
+G_GNUC_INTERNAL
+void rsvg_node_svg_apply_atts (RsvgNode *node, RsvgHandle *handle);
 
 struct RsvgLoad {
     RsvgHandle *handle;
@@ -300,25 +305,6 @@ free_element_name_stack (RsvgLoad *load)
 }
 
 static void
-node_set_atts (RsvgNode *node,
-               RsvgHandle *handle,
-               const char *element_name,
-               RsvgPropertyBag atts)
-{
-    rsvg_node_set_atts (node, handle, atts);
-
-    /* The "svg" node is special; it will load its id/class
-     * attributes until the end, when sax_end_element_cb() calls
-     * rsvg_node_svg_apply_atts()
-     */
-    if (rsvg_node_get_type (node) != RSVG_NODE_TYPE_SVG) {
-        rsvg_parse_style_attrs (handle, node, element_name, atts);
-    }
-
-    rsvg_node_set_overridden_properties (node);
-}
-
-static void
 standard_element_start (RsvgLoad *load, const char *name, RsvgPropertyBag * atts)
 {
     RsvgNode *newnode;
@@ -342,7 +328,8 @@ standard_element_start (RsvgLoad *load, const char *name, RsvgPropertyBag * atts
     load->currentnode = rsvg_node_ref (newnode);
 
     rsvg_node_register_in_defs (newnode, load->handle->priv->defs);
-    node_set_atts (newnode, load->handle, name, atts);
+
+    rsvg_load_set_node_atts (load->handle, newnode, name, atts);
 
     newnode = rsvg_node_unref (newnode);
 }
@@ -447,21 +434,83 @@ create_xml_push_parser (RsvgLoad *load,
     return parser;
 }
 
+typedef struct {
+    GInputStream *stream;
+    GCancellable *cancellable;
+    GError      **error;
+} RsvgXmlInputStreamContext;
+
+/* this should use gsize, but libxml2 is borked */
+static int
+context_read (void *data,
+              char *buffer,
+              int   len)
+{
+    RsvgXmlInputStreamContext *context = data;
+    gssize n_read;
+
+    if (*(context->error))
+        return -1;
+
+    n_read = g_input_stream_read (context->stream, buffer, (gsize) len,
+                                  context->cancellable,
+                                  context->error);
+    if (n_read < 0)
+        return -1;
+
+    return (int) n_read;
+}
+
+static int
+context_close (void *data)
+{
+    RsvgXmlInputStreamContext *context = data;
+    gboolean ret;
+
+    /* Don't overwrite a previous error */
+    ret = g_input_stream_close (context->stream, context->cancellable,
+                                *(context->error) == NULL ? context->error : NULL);
+
+    g_object_unref (context->stream);
+    if (context->cancellable)
+        g_object_unref (context->cancellable);
+    g_slice_free (RsvgXmlInputStreamContext, context);
+
+    return ret ? 0 : -1;
+}
+
 static xmlParserCtxtPtr
 create_xml_stream_parser (RsvgLoad      *load,
                           GInputStream  *stream,
                           GCancellable  *cancellable,
                           GError       **error)
 {
+    RsvgXmlInputStreamContext *context;
     xmlParserCtxtPtr parser;
 
+    g_return_val_if_fail (G_IS_INPUT_STREAM (stream), NULL);
+    g_return_val_if_fail (cancellable == NULL || G_IS_CANCELLABLE (cancellable), NULL);
+    g_return_val_if_fail (error != NULL, NULL);
+
     init_sax_handler_struct ();
-    parser = rsvg_create_xml_parser_from_stream (&rsvgSAXHandlerStruct,
-                                                 load,
-                                                 stream,
-                                                 cancellable,
-                                                 error);
-    if (parser) {
+
+    context = g_slice_new (RsvgXmlInputStreamContext);
+    context->stream = g_object_ref (stream);
+    context->cancellable = cancellable ? g_object_ref (cancellable) : NULL;
+    context->error = error;
+
+    parser = xmlCreateIOParserCtxt (&rsvgSAXHandlerStruct,
+                                    load,
+                                    context_read,
+                                    context_close,
+                                    context,
+                                    XML_CHAR_ENCODING_NONE);
+
+    if (!parser) {
+        g_set_error (error, rsvg_error_quark (), 0, _("Error creating XML parser"));
+
+        /* on error, xmlCreateIOParserCtxt() frees our context via the context_close function */
+    } else {
         set_xml_parse_options (parser, load->unlimited_size);
     }
 
@@ -640,97 +689,34 @@ sax_end_element_cb (void *data, const xmlChar * xmlname)
     }
 }
 
+/* Implemented in rust/src/node.rs */
+extern RsvgNode *rsvg_node_find_last_chars_child(RsvgNode *node, gboolean *accept_chars);
+
 /* Implemented in rust/src/text.rs */
 extern RsvgNode *rsvg_node_chars_new(RsvgNode *parent);
 
 /* Implemented in rust/src/text.rs */
 extern void rsvg_node_chars_append (RsvgNode *node, const char *text, gssize len);
 
-static gboolean
-node_is_text_or_tspan (RsvgNode *node)
-{
-    RsvgNodeType type;
-
-    if (!node) {
-        return FALSE;
-    }
-
-    type = rsvg_node_get_type (node);
-    return type == RSVG_NODE_TYPE_TEXT || type == RSVG_NODE_TYPE_TSPAN;
-}
-
-/* Finds the last chars child inside a given @node to which new characters can
- * be appended.  @node can be null; in this case we'll return NULL as we didn't
- * find any children.
- */
-static RsvgNode *
-find_last_chars_child (RsvgNode *node)
-{
-    RsvgNode *child = NULL;
-
-    RsvgNode *temp;
-    RsvgNodeChildrenIter *iter;
-
-    if (node_is_text_or_tspan (node)) {
-        /* find the last CHARS node in the text or tspan node, so that we can
-         * coalesce the text, and thus avoid screwing up the Pango layouts.
-         */
-        iter = rsvg_node_children_iter_begin (node);
-
-        while (rsvg_node_children_iter_next_back (iter, &temp)) {
-            /* If a tspan node is encountered before any chars node
-             * (which means there's a tspan node after any chars nodes,
-             * because this is backwards iteration), return NULL.
-             */
-            if (rsvg_node_get_type (temp) == RSVG_NODE_TYPE_TSPAN) {
-                temp = rsvg_node_unref (temp);
-                break;
-            } else if (rsvg_node_get_type (temp) == RSVG_NODE_TYPE_CHARS) {
-                child = temp;
-                break;
-            } else {
-                temp = rsvg_node_unref (temp);
-            }
-        }
-
-        rsvg_node_children_iter_end (iter);
-    }
-
-    return child;
-}
-
-static RsvgNode *
-add_new_chars_child_to_current_node (RsvgLoad *load)
-{
-    RsvgNode *node;
-
-    node = rsvg_node_chars_new (load->currentnode);
-    rsvg_add_node_to_handle (load->handle, node);
-
-    if (load->currentnode) {
-        rsvg_node_add_child (load->currentnode, node);
-    }
-
-    return node;
-}
-
 static void
 characters_impl (RsvgLoad *load, const char *ch, gssize len)
 {
-    RsvgNode *node = NULL;
+    RsvgNode *node;
+    gboolean accept_chars = FALSE;
 
-    if (!ch || !len) {
+    if (!ch || !len || !load->currentnode) {
         return;
     }
 
-    if (!node_is_text_or_tspan (load->currentnode)) {
+    node = rsvg_node_find_last_chars_child (load->currentnode, &accept_chars);
+    if (!accept_chars) {
         return;
     }
-
-    node = find_last_chars_child (load->currentnode);
 
     if (!node) {
-        node = add_new_chars_child_to_current_node (load);
+        node = rsvg_node_chars_new (load->currentnode);
+        rsvg_add_node_to_handle (load->handle, node);
+        rsvg_node_add_child (load->currentnode, node);
     }
 
     g_assert (rsvg_node_get_type (node) == RSVG_NODE_TYPE_CHARS);
@@ -946,6 +932,8 @@ sax_processing_instruction_cb (void *user_data, const xmlChar * target, const xm
                     break;
                 }
             }
+
+            rsvg_property_bag_iter_end (iter);
 
             if ((!alternate || strcmp (alternate, "no") != 0)
                 && type && strcmp (type, "text/css") == 0

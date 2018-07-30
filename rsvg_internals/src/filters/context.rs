@@ -1,32 +1,22 @@
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
-use std::ffi::CStr;
-use std::{mem, ptr};
+use std::f64;
 
-use cairo::prelude::SurfaceExt;
 use cairo::{self, MatrixTrait};
-use cairo_sys::cairo_surface_t;
-use glib::translate::{from_glib_none, ToGlibPtr};
-use glib_sys::*;
 
 use bbox::BoundingBox;
 use coord_units::CoordUnits;
-use drawing_ctx::{self, RsvgDrawingCtx};
-use length::RsvgLength;
-use node::{box_node, RsvgNode};
+use drawing_ctx::DrawingCtx;
+use length::Length;
+use node::RsvgNode;
 use paint_server::{self, PaintServer};
+use surface_utils::shared_surface::{SharedImageSurface, SurfaceType};
 use unitinterval::UnitInterval;
 
-use super::bounds::BoundsBuilder;
+use super::error::FilterError;
 use super::input::Input;
-use super::iterators::{ImageSurfaceDataShared, Pixel, Pixels};
 use super::node::NodeFilter;
-use super::RsvgFilterPrimitive;
 
-// Required by the C code until all filters are ported to Rust.
-// Keep this in sync with
-// ../../librsvg/librsvg/rsvg-filter.h:RsvgIRect
-#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IRect {
     pub x0: i32,
@@ -35,20 +25,11 @@ pub struct IRect {
     pub y1: i32,
 }
 
-// Required by the C code until all filters are ported to Rust.
-// Keep this in sync with
-// ../../librsvg/librsvg/filters/common.h:_RsvgFilterPrimitiveOutput
-#[repr(C)]
-pub struct RsvgFilterPrimitiveOutput {
-    surface: *mut cairo_surface_t,
-    bounds: IRect,
-}
-
 /// A filter primitive output.
 #[derive(Debug, Clone)]
 pub struct FilterOutput {
     /// The surface after the filter primitive was applied.
-    pub surface: cairo::ImageSurface,
+    pub surface: SharedImageSurface,
 
     /// The filter primitive subregion.
     pub bounds: IRect,
@@ -68,12 +49,10 @@ pub struct FilterResult {
 #[derive(Debug, Clone)]
 pub enum FilterInput {
     /// One of the standard inputs.
-    StandardInput(cairo::ImageSurface),
+    StandardInput(SharedImageSurface),
     /// Output of another filter primitive.
     PrimitiveOutput(FilterOutput),
 }
-
-pub type RsvgFilterContext = FilterContext;
 
 /// The filter rendering context.
 pub struct FilterContext {
@@ -82,17 +61,20 @@ pub struct FilterContext {
     /// The node which referenced this filter.
     node_being_filtered: RsvgNode,
     /// The source graphic surface.
-    source_surface: cairo::ImageSurface,
+    source_surface: SharedImageSurface,
     /// Output of the last filter primitive.
     last_result: Option<FilterOutput>,
     /// Surfaces of the previous filter primitives by name.
     previous_results: HashMap<String, FilterOutput>,
     /// The background surface. Computed lazily.
-    background_surface: UnsafeCell<Option<Result<cairo::ImageSurface, cairo::Status>>>,
-    /// The drawing context.
-    drawing_ctx: *mut RsvgDrawingCtx,
+    background_surface: UnsafeCell<Option<Result<SharedImageSurface, FilterError>>>,
     /// The filter effects region.
     effects_region: BoundingBox,
+    /// Whether the currently rendered filter primitive uses linear RGB for color operations.
+    ///
+    /// This affects `get_input()` and `store_result()` which should perform linearization and
+    /// unlinearization respectively when this is set to `true`.
+    processing_linear_rgb: bool,
 
     /// The filter element affine matrix.
     ///
@@ -109,43 +91,19 @@ pub struct FilterContext {
     /// This is to be used in conjunction with setting the viewbox size to account for the scaling.
     /// For `filterUnits == userSpaceOnUse`, the viewbox will have the actual resolution size, and
     /// for `filterUnits == objectBoundingBox`, the viewbox will have the size of 1, 1.
-    affine: cairo::Matrix,
+    _affine: cairo::Matrix,
 
     /// The filter primitive affine matrix.
     ///
-    /// See the comments for `affine`, they largely apply here.
+    /// See the comments for `_affine`, they largely apply here.
     paffine: cairo::Matrix,
-
-    channelmap: [i32; 4],
-}
-
-/// Returns a surface with black background and alpha channel matching the input surface.
-fn extract_alpha(
-    surface: &cairo::ImageSurface,
-    bounds: IRect,
-) -> Result<cairo::ImageSurface, cairo::Status> {
-    let data = unsafe { ImageSurfaceDataShared::new_unchecked(surface).unwrap() };
-
-    let mut output_surface =
-        cairo::ImageSurface::create(cairo::Format::ARgb32, data.width as i32, data.height as i32)?;
-
-    let output_stride = output_surface.get_stride() as usize;
-    {
-        let mut output_data = output_surface.get_data().unwrap();
-
-        for (x, y, Pixel { a, .. }) in Pixels::new(data, bounds) {
-            output_data[y * output_stride + x * 4 + 3] = a;
-        }
-    }
-
-    Ok(output_surface)
 }
 
 /// Computes and returns the filter effects region.
 fn compute_effects_region(
     filter_node: &RsvgNode,
     target_node: &RsvgNode,
-    drawing_ctx: *mut RsvgDrawingCtx,
+    draw_ctx: &mut DrawingCtx,
     affine: cairo::Matrix,
     width: f64,
     height: f64,
@@ -168,7 +126,7 @@ fn compute_effects_region(
     // represent the fractions of the referenced node, and with width and height = 1, 1 this
     // works out exactly like that.
     if filter.filterunits.get() == CoordUnits::ObjectBoundingBox {
-        drawing_ctx::push_view_box(drawing_ctx, 1f64, 1f64);
+        draw_ctx.push_view_box(1.0, 1.0);
     }
 
     // With filterunits == ObjectBoundingBox, lengths represent fractions or percentages of the
@@ -182,15 +140,15 @@ fn compute_effects_region(
         }
     } else {
         cairo::Rectangle {
-            x: filter.x.get().normalize(values, drawing_ctx),
-            y: filter.y.get().normalize(values, drawing_ctx),
-            width: filter.width.get().normalize(values, drawing_ctx),
-            height: filter.height.get().normalize(values, drawing_ctx),
+            x: filter.x.get().normalize(values, draw_ctx),
+            y: filter.y.get().normalize(values, draw_ctx),
+            width: filter.width.get().normalize(values, draw_ctx),
+            height: filter.height.get().normalize(values, draw_ctx),
         }
     };
 
     if filter.filterunits.get() == CoordUnits::ObjectBoundingBox {
-        drawing_ctx::pop_view_box(drawing_ctx);
+        draw_ctx.pop_view_box();
     }
 
     let other_bbox = BoundingBox::new(&affine).with_rect(Some(rect));
@@ -218,6 +176,19 @@ impl IRect {
     pub fn contains(self, x: i32, y: i32) -> bool {
         x >= self.x0 && x < self.x1 && y >= self.y0 && y < self.y1
     }
+
+    /// Returns an `IRect` scaled by the given amounts.
+    ///
+    /// The returned `IRect` encompasses all, even partially covered, pixels after the scaling.
+    #[inline]
+    pub fn scale(self, x: f64, y: f64) -> IRect {
+        IRect {
+            x0: (f64::from(self.x0) * x).floor() as i32,
+            y0: (f64::from(self.y0) * y).floor() as i32,
+            x1: (f64::from(self.x1) * x).ceil() as i32,
+            y1: (f64::from(self.y1) * y).ceil() as i32,
+        }
+    }
 }
 
 impl FilterContext {
@@ -225,13 +196,20 @@ impl FilterContext {
     pub fn new(
         filter_node: &RsvgNode,
         node_being_filtered: &RsvgNode,
-        source_surface: cairo::ImageSurface,
-        draw_ctx: *mut RsvgDrawingCtx,
-        channelmap: [i32; 4],
+        source_surface: SharedImageSurface,
+        draw_ctx: &mut DrawingCtx,
     ) -> Self {
-        let cr_affine = drawing_ctx::get_cairo_context(draw_ctx).get_matrix();
-        let bbox = drawing_ctx::get_bbox(draw_ctx);
-        let bbox_rect = bbox.rect.unwrap();
+        let cr_affine = draw_ctx.get_cairo_context().get_matrix();
+        let bbox = draw_ctx.get_bbox().clone();
+
+        // The rect can be empty (for example, if the filter is applied to an empty group).
+        // However, with userSpaceOnUse it's still possible to create images with a filter.
+        let bbox_rect = bbox.rect.unwrap_or(cairo::Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 0.0,
+        });
 
         let filter = filter_node.get_impl::<NodeFilter>().unwrap();
 
@@ -265,17 +243,16 @@ impl FilterContext {
             }
         };
 
-        let width = source_surface.get_width();
-        let height = source_surface.get_height();
+        let width = source_surface.width();
+        let height = source_surface.height();
 
-        let mut rv = Self {
+        Self {
             node: filter_node.clone(),
             node_being_filtered: node_being_filtered.clone(),
             source_surface,
             last_result: None,
             previous_results: HashMap::new(),
             background_surface: UnsafeCell::new(None),
-            drawing_ctx: draw_ctx,
             effects_region: compute_effects_region(
                 filter_node,
                 node_being_filtered,
@@ -284,18 +261,10 @@ impl FilterContext {
                 f64::from(width),
                 f64::from(height),
             ),
-            affine,
+            processing_linear_rgb: false,
+            _affine: affine,
             paffine,
-            channelmap,
-        };
-
-        let last_result = FilterOutput {
-            surface: rv.source_surface.clone(),
-            bounds: rv.effects_region().rect.unwrap().into(),
-        };
-
-        rv.last_result = Some(last_result);
-        rv
+        }
     }
 
     /// Returns the <filter> node for this context.
@@ -318,30 +287,38 @@ impl FilterContext {
 
     /// Returns the surface corresponding to the source graphic.
     #[inline]
-    pub fn source_graphic(&self) -> &cairo::ImageSurface {
+    pub fn source_graphic(&self) -> &SharedImageSurface {
         &self.source_surface
     }
 
     /// Returns the surface containing the source graphic alpha.
     #[inline]
-    pub fn source_alpha(&self, bounds: IRect) -> Result<cairo::ImageSurface, cairo::Status> {
-        extract_alpha(self.source_graphic(), bounds)
+    pub fn source_alpha(&self, bounds: IRect) -> Result<SharedImageSurface, FilterError> {
+        self.source_surface
+            .extract_alpha(bounds)
+            .map_err(FilterError::CairoError)
     }
 
     /// Computes and returns the background image snapshot.
-    fn compute_background_image(&self) -> Result<cairo::ImageSurface, cairo::Status> {
+    fn compute_background_image(
+        &self,
+        draw_ctx: &DrawingCtx,
+    ) -> Result<cairo::ImageSurface, cairo::Status> {
         let surface = cairo::ImageSurface::create(
             cairo::Format::ARgb32,
-            self.source_surface.get_width(),
-            self.source_surface.get_height(),
+            self.source_surface.width(),
+            self.source_surface.height(),
         )?;
 
-        let (x, y) = drawing_ctx::get_raw_offset(self.drawing_ctx);
-        let stack = drawing_ctx::get_cr_stack(self.drawing_ctx);
+        let (x, y) = draw_ctx.get_raw_offset();
+        let stack = draw_ctx.get_cr_stack();
 
+        // TODO: as far as I can tell this should not render elements past the last (topmost) one
+        // with enable-background: new (because technically we shouldn't have been caching them).
+        // Right now there are no enable-background checks whatsoever.
         let cr = cairo::Context::new(&surface);
-        for draw in stack.into_iter().rev() {
-            let nested = drawing_ctx::is_cairo_context_nested(self.drawing_ctx, &draw);
+        for draw in stack.into_iter() {
+            let nested = draw_ctx.is_cairo_context_nested(&draw);
             cr.set_source_surface(
                 &draw.get_target(),
                 if nested { 0f64 } else { -x },
@@ -354,7 +331,10 @@ impl FilterContext {
     }
 
     /// Returns the surface corresponding to the background image snapshot.
-    pub fn background_image(&self) -> Result<&cairo::ImageSurface, cairo::Status> {
+    pub fn background_image(
+        &self,
+        draw_ctx: &DrawingCtx,
+    ) -> Result<&SharedImageSurface, FilterError> {
         {
             // At this point either no, or only immutable references to background_surface exist, so
             // it's ok to make an immutable reference.
@@ -371,7 +351,14 @@ impl FilterContext {
         // no references to it and we can create a mutable reference.
         let bg = unsafe { &mut *self.background_surface.get() };
 
-        *bg = Some(self.compute_background_image());
+        *bg = Some(
+            self.compute_background_image(draw_ctx)
+                .map_err(FilterError::CairoError)
+                .and_then(|surface| {
+                    SharedImageSurface::new(surface, SurfaceType::SRgb)
+                        .map_err(FilterError::CairoError)
+                }),
+        );
 
         // Return the only existing reference as immutable.
         bg.as_ref().unwrap().as_ref().map_err(|&s| s)
@@ -379,9 +366,14 @@ impl FilterContext {
 
     /// Returns the surface containing the background image snapshot alpha.
     #[inline]
-    pub fn background_alpha(&self, bounds: IRect) -> Result<cairo::ImageSurface, cairo::Status> {
-        self.background_image()
-            .and_then(|surface| extract_alpha(surface, bounds))
+    pub fn background_alpha(
+        &self,
+        draw_ctx: &DrawingCtx,
+        bounds: IRect,
+    ) -> Result<SharedImageSurface, FilterError> {
+        self.background_image(draw_ctx)?
+            .extract_alpha(bounds)
+            .map_err(FilterError::CairoError)
     }
 
     /// Returns the output of the filter primitive by its result name.
@@ -392,27 +384,37 @@ impl FilterContext {
 
     /// Converts this `FilterContext` into the surface corresponding to the output of the filter
     /// chain.
+    ///
+    /// The returned surface is in the sRGB color space.
+    // TODO: sRGB conversion should probably be done by the caller.
     #[inline]
-    pub fn into_output(self) -> cairo::ImageSurface {
-        self.last_result
-            .map(|FilterOutput { surface, .. }| surface)
-            .unwrap_or(self.source_surface)
+    pub fn into_output(self) -> Result<SharedImageSurface, FilterError> {
+        match self.last_result {
+            Some(FilterOutput { surface, bounds }) => {
+                surface.to_srgb(bounds).map_err(FilterError::CairoError)
+            }
+            None => {
+                let empty_surface = cairo::ImageSurface::create(
+                    cairo::Format::ARgb32,
+                    self.source_surface.width(),
+                    self.source_surface.height(),
+                ).map_err(FilterError::CairoError)?;
+
+                SharedImageSurface::new(empty_surface, SurfaceType::AlphaOnly)
+                    .map_err(FilterError::CairoError)
+            }
+        }
     }
 
     /// Stores a filter primitive result into the context.
     #[inline]
-    pub fn store_result(&mut self, result: FilterResult) {
+    pub fn store_result(&mut self, result: FilterResult) -> Result<(), FilterError> {
         if let Some(name) = result.name {
             self.previous_results.insert(name, result.output.clone());
         }
 
         self.last_result = Some(result.output);
-    }
-
-    /// Returns the drawing context for this filter context.
-    #[inline]
-    pub fn drawing_context(&self) -> *mut RsvgDrawingCtx {
-        self.drawing_ctx
+        Ok(())
     }
 
     /// Returns the paffine matrix.
@@ -428,10 +430,10 @@ impl FilterContext {
     }
 
     /// Calls the given function with correct behavior for the value of `primitiveUnits`.
-    pub fn with_primitive_units<F, T>(&self, f: F) -> T
+    pub fn with_primitive_units<F, T>(&self, draw_ctx: &mut DrawingCtx, f: F) -> T
     // TODO: Get rid of this Box? Can't just impl Trait because Rust cannot do higher-ranked types.
     where
-        for<'a> F: FnOnce(Box<Fn(&RsvgLength) -> f64 + 'a>) -> T,
+        for<'b> F: FnOnce(Box<Fn(&Length) -> f64 + 'b>) -> T,
     {
         // Filters use the properties of the target node.
         let cascaded = self.node_being_filtered.get_cascaded_values();
@@ -441,16 +443,14 @@ impl FilterContext {
 
         // See comments in compute_effects_region() for how this works.
         if filter.primitiveunits.get() == CoordUnits::ObjectBoundingBox {
-            drawing_ctx::push_view_box(self.drawing_ctx, 1f64, 1f64);
-
-            let rv = f(Box::new(RsvgLength::get_unitless));
-
-            drawing_ctx::pop_view_box(self.drawing_ctx);
+            draw_ctx.push_view_box(1.0, 1.0);
+            let rv = f(Box::new(Length::get_unitless));
+            draw_ctx.pop_view_box();
 
             rv
         } else {
-            f(Box::new(|length: &RsvgLength| {
-                length.normalize(values, self.drawing_ctx)
+            f(Box::new(|length: &Length| {
+                length.normalize(values, draw_ctx)
             }))
         }
     }
@@ -458,46 +458,55 @@ impl FilterContext {
     /// Computes and returns a surface corresponding to the given paint server.
     fn get_paint_server_surface(
         &self,
+        draw_ctx: &mut DrawingCtx,
         paint_server: &PaintServer,
         opacity: UnitInterval,
     ) -> Result<cairo::ImageSurface, cairo::Status> {
         let surface = cairo::ImageSurface::create(
             cairo::Format::ARgb32,
-            self.source_surface.get_width(),
-            self.source_surface.get_height(),
+            self.source_surface.width(),
+            self.source_surface.height(),
         )?;
 
-        let cr_save = drawing_ctx::get_cairo_context(self.drawing_ctx);
+        let cr_save = draw_ctx.get_cairo_context();
         let cr = cairo::Context::new(&surface);
-        drawing_ctx::set_cairo_context(self.drawing_ctx, &cr);
+        draw_ctx.set_cairo_context(&cr);
 
         let cascaded = self.node_being_filtered.get_cascaded_values();
         let values = cascaded.get();
 
+        let bbox = draw_ctx.get_bbox().clone();
+
         if paint_server::set_source_paint_server(
-            self.drawing_ctx,
+            draw_ctx,
             paint_server,
             &opacity,
-            drawing_ctx::get_bbox(self.drawing_ctx),
+            &bbox,
             &values.color.0,
         ) {
             cr.paint();
         }
 
-        drawing_ctx::set_cairo_context(self.drawing_ctx, &cr_save);
+        draw_ctx.set_cairo_context(&cr_save);
         Ok(surface)
     }
 
     /// Retrieves the filter input surface according to the SVG rules.
-    pub fn get_input(&self, in_: Option<&Input>) -> Option<FilterInput> {
+    ///
+    /// Does not take `processing_linear_rgb` into account.
+    fn get_input_raw(
+        &self,
+        draw_ctx: &mut DrawingCtx,
+        in_: Option<&Input>,
+    ) -> Result<FilterInput, FilterError> {
         if in_.is_none() {
             // No value => use the last result.
             // As per the SVG spec, if the filter primitive is the first in the chain, return the
             // source graphic.
             if let Some(output) = self.last_result().cloned() {
-                return Some(FilterInput::PrimitiveOutput(output));
+                return Ok(FilterInput::PrimitiveOutput(output));
             } else {
-                return Some(FilterInput::StandardInput(self.source_graphic().clone()));
+                return Ok(FilterInput::StandardInput(self.source_graphic().clone()));
             }
         }
 
@@ -505,42 +514,97 @@ impl FilterContext {
         let values = cascaded.get();
 
         match *in_.unwrap() {
-            Input::SourceGraphic => Some(FilterInput::StandardInput(self.source_graphic().clone())),
+            Input::SourceGraphic => Ok(FilterInput::StandardInput(self.source_graphic().clone())),
             Input::SourceAlpha => self
                 .source_alpha(self.effects_region().rect.unwrap().into())
-                .ok()
                 .map(FilterInput::StandardInput),
             Input::BackgroundImage => self
-                .background_image()
-                .ok()
-                .cloned()
+                .background_image(draw_ctx)
+                .map(Clone::clone)
                 .map(FilterInput::StandardInput),
             Input::BackgroundAlpha => self
-                .background_alpha(self.effects_region().rect.unwrap().into())
-                .ok()
+                .background_alpha(draw_ctx, self.effects_region().rect.unwrap().into())
                 .map(FilterInput::StandardInput),
 
             Input::FillPaint => self
-                .get_paint_server_surface(&values.fill.0, values.fill_opacity.0)
-                .ok()
+                .get_paint_server_surface(draw_ctx, &values.fill.0, values.fill_opacity.0)
+                .map_err(FilterError::CairoError)
+                .and_then(|surface| {
+                    SharedImageSurface::new(surface, SurfaceType::SRgb)
+                        .map_err(FilterError::CairoError)
+                })
                 .map(FilterInput::StandardInput),
             Input::StrokePaint => self
-                .get_paint_server_surface(&values.stroke.0, values.stroke_opacity.0)
-                .ok()
+                .get_paint_server_surface(draw_ctx, &values.stroke.0, values.stroke_opacity.0)
+                .map_err(FilterError::CairoError)
+                .and_then(|surface| {
+                    SharedImageSurface::new(surface, SurfaceType::SRgb)
+                        .map_err(FilterError::CairoError)
+                })
                 .map(FilterInput::StandardInput),
 
             Input::FilterOutput(ref name) => self
                 .filter_output(name)
                 .cloned()
-                .map(FilterInput::PrimitiveOutput),
+                .map(FilterInput::PrimitiveOutput)
+                .ok_or(FilterError::InvalidInput),
         }
+    }
+
+    /// Retrieves the filter input surface according to the SVG rules.
+    pub fn get_input(
+        &self,
+        draw_ctx: &mut DrawingCtx,
+        in_: Option<&Input>,
+    ) -> Result<FilterInput, FilterError> {
+        let raw = self.get_input_raw(draw_ctx, in_)?;
+
+        // Linearize the returned surface if needed.
+        if self.processing_linear_rgb {
+            let (surface, bounds) = match raw {
+                FilterInput::StandardInput(ref surface) => {
+                    (surface, self.effects_region().rect.unwrap().into())
+                }
+                FilterInput::PrimitiveOutput(FilterOutput {
+                    ref surface,
+                    ref bounds,
+                }) => (surface, *bounds),
+            };
+
+            surface
+                .to_linear_rgb(bounds)
+                .map_err(FilterError::CairoError)
+                .map(|surface| match raw {
+                    FilterInput::StandardInput(_) => FilterInput::StandardInput(surface),
+                    FilterInput::PrimitiveOutput(ref output) => {
+                        FilterInput::PrimitiveOutput(FilterOutput { surface, ..*output })
+                    }
+                })
+        } else {
+            Ok(raw)
+        }
+    }
+
+    /// Calls the given closure with linear RGB processing enabled.
+    #[inline]
+    pub fn with_linear_rgb<T, F: FnOnce(&mut FilterContext) -> T>(&mut self, f: F) -> T {
+        self.processing_linear_rgb = true;
+        let rv = f(self);
+        self.processing_linear_rgb = false;
+        rv
+    }
+
+    /// Applies the `primitiveUnits` coordinate transformation to a non-x or y distance.
+    #[inline]
+    pub fn transform_dist(&self, d: f64) -> f64 {
+        d * (self.paffine.xx.powi(2) + self.paffine.yy.powi(2)).sqrt() / f64::consts::SQRT_2
     }
 }
 
 impl FilterInput {
     /// Retrieves the surface from `FilterInput`.
     #[inline]
-    pub fn surface(&self) -> &cairo::ImageSurface {
+    pub fn surface(&self) -> &SharedImageSurface {
         match *self {
             FilterInput::StandardInput(ref surface) => surface,
             FilterInput::PrimitiveOutput(FilterOutput { ref surface, .. }) => surface,
@@ -567,264 +631,15 @@ impl From<cairo::Rectangle> for IRect {
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn rsvg_filter_context_get_affine(
-    ctx: *const RsvgFilterContext,
-) -> cairo::Matrix {
-    assert!(!ctx.is_null());
-
-    (*ctx).affine
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn rsvg_filter_context_get_paffine(
-    ctx: *const RsvgFilterContext,
-) -> cairo::Matrix {
-    assert!(!ctx.is_null());
-
-    (*ctx).paffine
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn rsvg_filter_context_get_drawing_ctx(
-    ctx: *mut RsvgFilterContext,
-) -> *mut RsvgDrawingCtx {
-    assert!(!ctx.is_null());
-
-    (*ctx).drawing_ctx
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn rsvg_filter_context_get_width(ctx: *const RsvgFilterContext) -> i32 {
-    assert!(!ctx.is_null());
-
-    (*ctx).source_surface.get_width()
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn rsvg_filter_context_get_height(ctx: *const RsvgFilterContext) -> i32 {
-    assert!(!ctx.is_null());
-
-    (*ctx).source_surface.get_height()
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn rsvg_filter_context_get_node_being_filtered(
-    ctx: *const RsvgFilterContext,
-) -> *mut RsvgNode {
-    assert!(!ctx.is_null());
-
-    box_node((*ctx).get_node_being_filtered())
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn rsvg_filter_context_get_channelmap(
-    ctx: *const RsvgFilterContext,
-) -> *const i32 {
-    assert!(!ctx.is_null());
-
-    (*ctx).channelmap.as_ptr()
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn rsvg_filter_context_get_source_surface(
-    ctx: *mut RsvgFilterContext,
-) -> *mut cairo_surface_t {
-    assert!(!ctx.is_null());
-
-    (*ctx).source_surface.to_glib_none().0
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn rsvg_filter_context_get_bg_surface(
-    ctx: *mut RsvgFilterContext,
-) -> *mut cairo_surface_t {
-    assert!(!ctx.is_null());
-
-    (*ctx)
-        .background_image()
-        .map(|surface| surface.to_glib_none().0)
-        .unwrap_or_else(|_| ptr::null_mut())
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn rsvg_filter_context_get_lastresult(
-    ctx: *mut RsvgFilterContext,
-) -> RsvgFilterPrimitiveOutput {
-    assert!(!ctx.is_null());
-
-    let ctx = &*ctx;
-
-    match ctx.last_result {
-        Some(FilterOutput {
-            ref surface,
-            ref bounds,
-        }) => RsvgFilterPrimitiveOutput {
-            surface: surface.to_glib_none().0,
-            bounds: *bounds,
-        },
-        None => RsvgFilterPrimitiveOutput {
-            surface: ctx.source_surface.to_glib_none().0,
-            bounds: ctx.effects_region().rect.unwrap().into(),
-        },
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn rsvg_filter_context_get_previous_result(
-    name: *mut GString,
-    ctx: *mut RsvgFilterContext,
-    output: *mut RsvgFilterPrimitiveOutput,
-) -> i32 {
-    assert!(!name.is_null());
-    assert!(!ctx.is_null());
-    assert!(!output.is_null());
-
-    if let Some(&FilterOutput {
-        ref surface,
-        ref bounds,
-    }) = (*ctx).filter_output(&CStr::from_ptr((*name).str).to_string_lossy())
-    {
-        *output = RsvgFilterPrimitiveOutput {
-            surface: surface.to_glib_none().0,
-            bounds: *bounds,
-        };
-        1
-    } else {
-        0
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn rsvg_filter_store_output(
-    name: *mut GString,
-    result: RsvgFilterPrimitiveOutput,
-    ctx: *mut RsvgFilterContext,
-) {
-    assert!(!name.is_null());
-    assert!(!result.surface.is_null());
-    assert!(!ctx.is_null());
-
-    let name = from_glib_none((*name).str);
-
-    let surface: cairo::Surface = from_glib_none(result.surface);
-    assert_eq!(surface.get_type(), cairo::SurfaceType::Image);
-    let surface = cairo::ImageSurface::from(surface).unwrap();
-
-    let result = FilterResult {
-        name: Some(name),
-        output: FilterOutput {
-            surface,
-            bounds: result.bounds,
-        },
-    };
-
-    (*ctx).store_result(result);
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn rsvg_filter_primitive_get_bounds(
-    primitive: *const RsvgFilterPrimitive,
-    ctx: *const RsvgFilterContext,
-) -> IRect {
-    assert!(!ctx.is_null());
-
-    let ctx = &*ctx;
-
-    let mut x = None;
-    let mut y = None;
-    let mut width = None;
-    let mut height = None;
-
-    if !primitive.is_null() {
-        if (*primitive).x_specified != 0 {
-            x = Some((*primitive).x)
-        };
-
-        if (*primitive).y_specified != 0 {
-            y = Some((*primitive).y)
-        };
-
-        if (*primitive).width_specified != 0 {
-            width = Some((*primitive).width)
-        };
-
-        if (*primitive).height_specified != 0 {
-            height = Some((*primitive).height)
-        };
-    }
-
-    // Doesn't take referenced nodes into account, which is wrong.
-    BoundsBuilder::new(ctx, x, y, width, height).into_irect()
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn rsvg_filter_get_result(
-    name: *const GString,
-    ctx: *const RsvgFilterContext,
-) -> RsvgFilterPrimitiveOutput {
-    assert!(!name.is_null());
-    assert!(!ctx.is_null());
-
-    let name: String = from_glib_none((*name).str);
-    let input = match &name[..] {
-        "" | "none" => None,
-        "SourceGraphic" => Some(Input::SourceGraphic),
-        "SourceAlpha" => Some(Input::SourceAlpha),
-        "BackgroundImage" => Some(Input::BackgroundImage),
-        "BackgroundAlpha" => Some(Input::BackgroundAlpha),
-        "FillPaint" => Some(Input::FillPaint),
-        "StrokePaint" => Some(Input::StrokePaint),
-        _ => Some(Input::FilterOutput(name)),
-    };
-
-    let ctx = &*ctx;
-
-    match ctx.get_input(input.as_ref()) {
-        None => RsvgFilterPrimitiveOutput {
-            surface: ptr::null_mut(),
-            bounds: IRect {
-                x0: 0,
-                x1: 0,
-                y0: 0,
-                y1: 0,
-            },
-        },
-        Some(input) => {
-            // HACK because to_glib_full() is unimplemented!() on ImageSurface.
-            let ptr = input.surface().to_glib_none().0;
-
-            let rv = RsvgFilterPrimitiveOutput {
-                surface: ptr,
-                bounds: match input {
-                    FilterInput::StandardInput(_) => ctx.effects_region().rect.unwrap().into(),
-                    FilterInput::PrimitiveOutput(FilterOutput { bounds, .. }) => bounds,
-                },
-            };
-
-            mem::forget(input);
-
-            rv
-        }
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn rsvg_filter_get_in(
-    name: *const GString,
-    ctx: *const RsvgFilterContext,
-) -> *mut cairo_surface_t {
-    rsvg_filter_get_result(name, ctx).surface
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use surface_utils::iterators::Pixels;
 
     #[test]
     fn test_extract_alpha() {
-        const WIDTH: usize = 32;
-        const HEIGHT: usize = 64;
+        const WIDTH: i32 = 32;
+        const HEIGHT: i32 = 64;
         const BOUNDS: IRect = IRect {
             x0: 8,
             x1: 24,
@@ -833,14 +648,13 @@ mod tests {
         };
         const FULL_BOUNDS: IRect = IRect {
             x0: 0,
-            x1: WIDTH as i32,
+            x1: WIDTH,
             y0: 0,
-            y1: HEIGHT as i32,
+            y1: HEIGHT,
         };
 
         let mut surface =
-            cairo::ImageSurface::create(cairo::Format::ARgb32, WIDTH as i32, HEIGHT as i32)
-                .unwrap();
+            cairo::ImageSurface::create(cairo::Format::ARgb32, WIDTH, HEIGHT).unwrap();
 
         // Fill the surface with some data.
         {
@@ -853,13 +667,11 @@ mod tests {
             }
         }
 
-        let alpha = extract_alpha(&surface, BOUNDS).unwrap();
-
-        let data = unsafe { ImageSurfaceDataShared::new(&surface).unwrap() };
-        let data_alpha = unsafe { ImageSurfaceDataShared::new(&alpha).unwrap() };
+        let surface = SharedImageSurface::new(surface, SurfaceType::SRgb).unwrap();
+        let alpha = surface.extract_alpha(BOUNDS).unwrap();
 
         for (x, y, p, pa) in
-            Pixels::new(data, FULL_BOUNDS).map(|(x, y, p)| (x, y, p, data_alpha.get_pixel(x, y)))
+            Pixels::new(&surface, FULL_BOUNDS).map(|(x, y, p)| (x, y, p, alpha.get_pixel(x, y)))
         {
             assert_eq!(pa.r, 0);
             assert_eq!(pa.g, 0);

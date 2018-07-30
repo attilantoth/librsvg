@@ -22,16 +22,18 @@ phf_codegen = "0.7.21"
 [dependencies]
 libc = "0.2"
 downcast-rs = "^1.0.0"
-regex = "^0.2.1"
+regex = "1"
 itertools = "0.7.4"
 pango = "0.4"
 pangocairo = "0.5"
 pango-sys = "0.6"
 pangocairo-sys = "0.7"
-cssparser = "0.23"
+cssparser = "0.24"
 lazy_static = "1.0.0"
 phf = "0.7.21"
 float-cmp = "0.4.0"
+nalgebra = "0.16"
+owning_ref = "0.3"
 
 [dependencies.cairo-sys-rs]
 version = "0.6"
@@ -59,7 +61,17 @@ version = "0.6"
 #git = "https://github.com/gtk-rs/sys"
 #branch = "master"
 
+[dev-dependencies]
+criterion = "0.2"
+
 [lib]
 name = "rsvg_internals"
 crate-type = ["staticlib", "lib"]
 
+[[bench]]
+name = "box_blur"
+harness = false
+
+[[bench]]
+name = "pixel_iterators"
+harness = false

@@ -1,13 +1,16 @@
 use std::cell::Cell;
 use std::cell::RefCell;
 
+use glib::translate::*;
+use glib_sys;
+
 use aspect_ratio::*;
 use attributes::Attribute;
-use drawing_ctx;
-use drawing_ctx::RsvgDrawingCtx;
+use drawing_ctx::DrawingCtx;
 use float_eq_cairo::ApproxEqCairo;
 use handle::RsvgHandle;
 use length::*;
+use libc;
 use node::*;
 use parsers::{parse, parse_and_validate, Parse};
 use property_bag::{OwnedPropertyBag, PropertyBag};
@@ -32,13 +35,13 @@ impl NodeTrait for NodeGroup {
         &self,
         node: &RsvgNode,
         cascaded: &CascadedValues,
-        draw_ctx: *mut RsvgDrawingCtx,
+        draw_ctx: &mut DrawingCtx,
         clipping: bool,
     ) {
         let values = cascaded.get();
 
-        drawing_ctx::with_discrete_layer(draw_ctx, node, values, clipping, &mut |_cr| {
-            node.draw_children(cascaded, draw_ctx, clipping);
+        draw_ctx.with_discrete_layer(node, values, clipping, &mut |dc| {
+            node.draw_children(cascaded, dc, clipping);
         });
     }
 }
@@ -74,19 +77,14 @@ impl NodeTrait for NodeSwitch {
         &self,
         node: &RsvgNode,
         cascaded: &CascadedValues,
-        draw_ctx: *mut RsvgDrawingCtx,
+        draw_ctx: &mut DrawingCtx,
         clipping: bool,
     ) {
         let values = cascaded.get();
 
-        drawing_ctx::with_discrete_layer(draw_ctx, node, values, clipping, &mut |_cr| {
+        draw_ctx.with_discrete_layer(node, values, clipping, &mut |dc| {
             if let Some(child) = node.children().find(|c| c.get_cond()) {
-                drawing_ctx::draw_node_from_stack(
-                    draw_ctx,
-                    &CascadedValues::new(cascaded, &child),
-                    &child,
-                    clipping,
-                );
+                dc.draw_node_from_stack(&CascadedValues::new(cascaded, &child), &child, clipping);
             }
         });
     }
@@ -94,10 +92,10 @@ impl NodeTrait for NodeSwitch {
 
 pub struct NodeSvg {
     preserve_aspect_ratio: Cell<AspectRatio>,
-    x: Cell<RsvgLength>,
-    y: Cell<RsvgLength>,
-    w: Cell<RsvgLength>,
-    h: Cell<RsvgLength>,
+    x: Cell<Length>,
+    y: Cell<Length>,
+    w: Cell<Length>,
+    h: Cell<Length>,
     vbox: Cell<Option<ViewBox>>,
     pbag: RefCell<Option<OwnedPropertyBag>>,
 }
@@ -106,10 +104,10 @@ impl NodeSvg {
     pub fn new() -> NodeSvg {
         NodeSvg {
             preserve_aspect_ratio: Cell::new(AspectRatio::default()),
-            x: Cell::new(RsvgLength::parse_str("0", LengthDir::Horizontal).unwrap()),
-            y: Cell::new(RsvgLength::parse_str("0", LengthDir::Vertical).unwrap()),
-            w: Cell::new(RsvgLength::parse_str("100%", LengthDir::Horizontal).unwrap()),
-            h: Cell::new(RsvgLength::parse_str("100%", LengthDir::Vertical).unwrap()),
+            x: Cell::new(Length::parse_str("0", LengthDir::Horizontal).unwrap()),
+            y: Cell::new(Length::parse_str("0", LengthDir::Vertical).unwrap()),
+            w: Cell::new(Length::parse_str("100%", LengthDir::Horizontal).unwrap()),
+            h: Cell::new(Length::parse_str("100%", LengthDir::Vertical).unwrap()),
             vbox: Cell::new(None),
             pbag: RefCell::new(None),
         }
@@ -149,14 +147,14 @@ impl NodeTrait for NodeSvg {
                     "width",
                     value,
                     LengthDir::Horizontal,
-                    RsvgLength::check_nonnegative,
+                    Length::check_nonnegative,
                 )?),
 
                 Attribute::Height => self.h.set(parse_and_validate(
                     "height",
                     value,
                     LengthDir::Vertical,
-                    RsvgLength::check_nonnegative,
+                    Length::check_nonnegative,
                 )?),
 
                 Attribute::ViewBox => self.vbox.set(parse("viewBox", value, ()).map(Some)?),
@@ -176,7 +174,7 @@ impl NodeTrait for NodeSvg {
         &self,
         node: &RsvgNode,
         cascaded: &CascadedValues,
-        draw_ctx: *mut RsvgDrawingCtx,
+        draw_ctx: &mut DrawingCtx,
         clipping: bool,
     ) {
         let values = cascaded.get();
@@ -199,12 +197,12 @@ impl NodeTrait for NodeSvg {
             self.preserve_aspect_ratio.get(),
             node,
             values,
-            drawing_ctx::get_cairo_context(draw_ctx).get_matrix(),
+            draw_ctx.get_cairo_context().get_matrix(),
             draw_ctx,
             clipping,
-            &mut |_cr| {
+            &mut |dc| {
                 // we don't push a layer because draw_in_viewport() already does it
-                node.draw_children(cascaded, draw_ctx, clipping);
+                node.draw_children(cascaded, dc, clipping);
             },
         );
     }
@@ -212,18 +210,18 @@ impl NodeTrait for NodeSvg {
 
 pub struct NodeUse {
     link: RefCell<Option<String>>,
-    x: Cell<RsvgLength>,
-    y: Cell<RsvgLength>,
-    w: Cell<Option<RsvgLength>>,
-    h: Cell<Option<RsvgLength>>,
+    x: Cell<Length>,
+    y: Cell<Length>,
+    w: Cell<Option<Length>>,
+    h: Cell<Option<Length>>,
 }
 
 impl NodeUse {
     pub fn new() -> NodeUse {
         NodeUse {
             link: RefCell::new(None),
-            x: Cell::new(RsvgLength::default()),
-            y: Cell::new(RsvgLength::default()),
+            x: Cell::new(Length::default()),
+            y: Cell::new(Length::default()),
             w: Cell::new(None),
             h: Cell::new(None),
         }
@@ -244,7 +242,7 @@ impl NodeTrait for NodeUse {
                         "width",
                         value,
                         LengthDir::Horizontal,
-                        RsvgLength::check_nonnegative,
+                        Length::check_nonnegative,
                     ).map(Some)?,
                 ),
                 Attribute::Height => self.h.set(
@@ -252,7 +250,7 @@ impl NodeTrait for NodeUse {
                         "height",
                         value,
                         LengthDir::Vertical,
-                        RsvgLength::check_nonnegative,
+                        Length::check_nonnegative,
                     ).map(Some)?,
                 ),
 
@@ -267,7 +265,7 @@ impl NodeTrait for NodeUse {
         &self,
         node: &RsvgNode,
         cascaded: &CascadedValues,
-        draw_ctx: *mut RsvgDrawingCtx,
+        draw_ctx: &mut DrawingCtx,
         clipping: bool,
     ) {
         let values = cascaded.get();
@@ -278,9 +276,9 @@ impl NodeTrait for NodeUse {
             return;
         }
 
-        let child = if let Some(acquired) =
-            drawing_ctx::get_acquired_node(draw_ctx, link.as_ref().unwrap())
-        {
+        let acquired = draw_ctx.get_acquired_node(link.as_ref().unwrap());
+
+        let child = if let Some(acquired) = acquired {
             acquired.get()
         } else {
             return;
@@ -302,12 +300,12 @@ impl NodeTrait for NodeUse {
         let nw = self
             .w
             .get()
-            .unwrap_or_else(|| RsvgLength::parse_str("100%", LengthDir::Horizontal).unwrap())
+            .unwrap_or_else(|| Length::parse_str("100%", LengthDir::Horizontal).unwrap())
             .normalize(values, draw_ctx);
         let nh = self
             .h
             .get()
-            .unwrap_or_else(|| RsvgLength::parse_str("100%", LengthDir::Vertical).unwrap())
+            .unwrap_or_else(|| Length::parse_str("100%", LengthDir::Vertical).unwrap())
             .normalize(values, draw_ctx);
 
         // width or height set to 0 disables rendering of the element
@@ -317,12 +315,11 @@ impl NodeTrait for NodeUse {
         }
 
         if child.get_type() != NodeType::Symbol {
-            let cr = drawing_ctx::get_cairo_context(draw_ctx);
+            let cr = draw_ctx.get_cairo_context();
             cr.translate(nx, ny);
 
-            drawing_ctx::with_discrete_layer(draw_ctx, node, values, clipping, &mut |_cr| {
-                drawing_ctx::draw_node_from_stack(
-                    draw_ctx,
+            draw_ctx.with_discrete_layer(node, values, clipping, &mut |dc| {
+                dc.draw_node_from_stack(
                     &CascadedValues::new_from_values(&child, values),
                     &child,
                     clipping,
@@ -345,14 +342,14 @@ impl NodeTrait for NodeUse {
                     symbol.preserve_aspect_ratio.get(),
                     node,
                     values,
-                    drawing_ctx::get_cairo_context(draw_ctx).get_matrix(),
+                    draw_ctx.get_cairo_context().get_matrix(),
                     draw_ctx,
                     clipping,
-                    &mut |_cr| {
+                    &mut |dc| {
                         // We don't push a layer because draw_in_viewport() already does it
                         child.draw_children(
                             &CascadedValues::new_from_values(&child, values),
-                            draw_ctx,
+                            dc,
                             clipping,
                         );
                     },
@@ -402,33 +399,36 @@ impl NodeTrait for NodeSymbol {
 #[no_mangle]
 pub extern "C" fn rsvg_node_svg_get_size(
     raw_node: *const RsvgNode,
-    out_width: *mut RsvgLength,
-    out_height: *mut RsvgLength,
-) {
+    dpi_x: libc::c_double,
+    dpi_y: libc::c_double,
+    out_width: *mut i32,
+    out_height: *mut i32,
+) -> glib_sys::gboolean {
     assert!(!raw_node.is_null());
     let node: &RsvgNode = unsafe { &*raw_node };
 
     assert!(!out_width.is_null());
     assert!(!out_height.is_null());
 
-    node.with_impl(|svg: &NodeSvg| unsafe {
-        *out_width = svg.w.get();
-        *out_height = svg.h.get();
-    });
-}
-
-#[no_mangle]
-pub extern "C" fn rsvg_node_svg_get_view_box(raw_node: *const RsvgNode) -> RsvgViewBox {
-    assert!(!raw_node.is_null());
-    let node: &RsvgNode = unsafe { &*raw_node };
-
-    let mut vbox: Option<ViewBox> = None;
-
-    node.with_impl(|svg: &NodeSvg| {
-        vbox = svg.vbox.get();
-    });
-
-    RsvgViewBox::from(vbox)
+    node.with_impl(
+        |svg: &NodeSvg| match (svg.w.get(), svg.h.get(), svg.vbox.get()) {
+            (w, h, Some(vb)) => {
+                unsafe {
+                    *out_width = w.hand_normalize(dpi_x, vb.0.width, 12.0).round() as i32;
+                    *out_height = h.hand_normalize(dpi_y, vb.0.height, 12.0).round() as i32;
+                }
+                true.to_glib()
+            }
+            (w, h, None) if w.unit != LengthUnit::Percent && h.unit != LengthUnit::Percent => {
+                unsafe {
+                    *out_width = w.hand_normalize(dpi_x, 0.0, 12.0).round() as i32;
+                    *out_height = h.hand_normalize(dpi_y, 0.0, 12.0).round() as i32;
+                }
+                true.to_glib()
+            }
+            (_, _, _) => false.to_glib(),
+        },
+    )
 }
 
 #[no_mangle]

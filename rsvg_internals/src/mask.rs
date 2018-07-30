@@ -5,10 +5,9 @@ use std::cell::Cell;
 
 use attributes::Attribute;
 use coord_units::CoordUnits;
-use draw;
-use drawing_ctx::{self, RsvgDrawingCtx};
+use drawing_ctx::DrawingCtx;
 use handle::RsvgHandle;
-use length::{LengthDir, RsvgLength};
+use length::{Length, LengthDir};
 use node::{NodeResult, NodeTrait, RsvgNode};
 use parsers::{parse, parse_and_validate, Parse};
 use property_bag::PropertyBag;
@@ -27,10 +26,10 @@ fn cairo_mask_surface(cr: &cairo::Context, surface: &cairo::Surface, x: f64, y: 
 }
 
 pub struct NodeMask {
-    x: Cell<RsvgLength>,
-    y: Cell<RsvgLength>,
-    width: Cell<RsvgLength>,
-    height: Cell<RsvgLength>,
+    x: Cell<Length>,
+    y: Cell<Length>,
+    width: Cell<Length>,
+    height: Cell<Length>,
 
     units: Cell<MaskUnits>,
     content_units: Cell<MaskContentUnits>,
@@ -50,25 +49,25 @@ impl NodeMask {
         }
     }
 
-    fn get_default_pos(dir: LengthDir) -> RsvgLength {
-        RsvgLength::parse_str("-10%", dir).unwrap()
+    fn get_default_pos(dir: LengthDir) -> Length {
+        Length::parse_str("-10%", dir).unwrap()
     }
 
-    fn get_default_size(dir: LengthDir) -> RsvgLength {
-        RsvgLength::parse_str("120%", dir).unwrap()
+    fn get_default_size(dir: LengthDir) -> Length {
+        Length::parse_str("120%", dir).unwrap()
     }
 
     pub fn generate_cairo_mask(
         &self,
         node: &RsvgNode,
         affine_before_mask: &cairo::Matrix,
-        draw_ctx: *mut RsvgDrawingCtx,
+        draw_ctx: &mut DrawingCtx,
     ) {
         let cascaded = node.get_cascaded_values();
         let values = cascaded.get();
 
-        let width = drawing_ctx::get_width(draw_ctx) as i32;
-        let height = drawing_ctx::get_height(draw_ctx) as i32;
+        let width = draw_ctx.get_width() as i32;
+        let height = draw_ctx.get_height() as i32;
 
         let mut surface = match cairo::ImageSurface::create(cairo::Format::ARgb32, width, height) {
             Ok(surface) => surface,
@@ -79,7 +78,7 @@ impl NodeMask {
         let content_units = CoordUnits::from(self.content_units.get());
 
         if mask_units == CoordUnits::ObjectBoundingBox {
-            drawing_ctx::push_view_box(draw_ctx, 1.0, 1.0);
+            draw_ctx.push_view_box(1.0, 1.0);
         }
 
         let x = self.x.get().normalize(&values, draw_ctx);
@@ -88,55 +87,58 @@ impl NodeMask {
         let h = self.height.get().normalize(&values, draw_ctx);
 
         if mask_units == CoordUnits::ObjectBoundingBox {
-            drawing_ctx::pop_view_box(draw_ctx);
+            draw_ctx.pop_view_box();
         }
 
         // Use a scope because mask_cr needs to release the
         // reference to the surface before we access the pixels
         {
-            let save_cr = drawing_ctx::get_cairo_context(draw_ctx);
+            let save_cr = draw_ctx.get_cairo_context();
 
             let mask_cr = cairo::Context::new(&surface);
             mask_cr.set_matrix(*affine_before_mask);
             mask_cr.transform(node.get_transform());
 
-            drawing_ctx::set_cairo_context(draw_ctx, &mask_cr);
+            draw_ctx.set_cairo_context(&mask_cr);
 
             if mask_units == CoordUnits::ObjectBoundingBox {
-                let bbox = drawing_ctx::get_bbox(draw_ctx);
-                let rect = bbox.rect.unwrap();
+                let rect = {
+                    let bbox = draw_ctx.get_bbox();
+                    bbox.rect.unwrap()
+                };
 
-                draw::add_clipping_rect(
-                    draw_ctx,
+                draw_ctx.clip(
                     x * rect.width + rect.x,
                     y * rect.height + rect.y,
                     w * rect.width,
                     h * rect.height,
                 );
             } else {
-                draw::add_clipping_rect(draw_ctx, x, y, w, h);
+                draw_ctx.clip(x, y, w, h);
             }
 
             if content_units == CoordUnits::ObjectBoundingBox {
-                let bbox = drawing_ctx::get_bbox(draw_ctx);
-                let rect = bbox.rect.unwrap();
+                let rect = {
+                    let bbox = draw_ctx.get_bbox();
+                    bbox.rect.unwrap()
+                };
                 let bbtransform =
                     cairo::Matrix::new(rect.width, 0.0, 0.0, rect.height, rect.x, rect.y);
 
                 mask_cr.transform(bbtransform);
 
-                drawing_ctx::push_view_box(draw_ctx, 1.0, 1.0);
+                draw_ctx.push_view_box(1.0, 1.0);
             }
 
-            drawing_ctx::with_discrete_layer(draw_ctx, node, values, false, &mut |_cr| {
-                node.draw_children(&cascaded, draw_ctx, false);
+            draw_ctx.with_discrete_layer(node, values, false, &mut |dc| {
+                node.draw_children(&cascaded, dc, false);
             });
 
             if content_units == CoordUnits::ObjectBoundingBox {
-                drawing_ctx::pop_view_box(draw_ctx);
+                draw_ctx.pop_view_box();
             }
 
-            drawing_ctx::set_cairo_context(draw_ctx, &save_cr);
+            draw_ctx.set_cairo_context(&save_cr);
         }
 
         {
@@ -174,11 +176,11 @@ impl NodeMask {
             }
         }
 
-        let cr = drawing_ctx::get_cairo_context(draw_ctx);
+        let cr = draw_ctx.get_cairo_context();
 
         cr.identity_matrix();
 
-        let (xofs, yofs) = drawing_ctx::get_offset(draw_ctx);
+        let (xofs, yofs) = draw_ctx.get_offset();
         cairo_mask_surface(&cr, &surface, xofs, yofs);
     }
 }
@@ -193,13 +195,13 @@ impl NodeTrait for NodeMask {
                     "width",
                     value,
                     LengthDir::Horizontal,
-                    RsvgLength::check_nonnegative,
+                    Length::check_nonnegative,
                 )?),
                 Attribute::Height => self.height.set(parse_and_validate(
                     "height",
                     value,
                     LengthDir::Vertical,
-                    RsvgLength::check_nonnegative,
+                    Length::check_nonnegative,
                 )?),
 
                 Attribute::MaskUnits => self.units.set(parse("maskUnits", value, ())?),

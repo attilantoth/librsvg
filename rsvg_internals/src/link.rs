@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 
 use attributes::Attribute;
-use drawing_ctx::{self, RsvgDrawingCtx};
+use drawing_ctx::DrawingCtx;
 use handle::RsvgHandle;
 use node::*;
 use property_bag::PropertyBag;
@@ -42,7 +42,7 @@ impl NodeTrait for NodeLink {
         &self,
         node: &RsvgNode,
         cascaded: &CascadedValues,
-        draw_ctx: *mut RsvgDrawingCtx,
+        draw_ctx: &mut DrawingCtx,
         clipping: bool,
     ) {
         let link = self.link.borrow();
@@ -50,21 +50,19 @@ impl NodeTrait for NodeLink {
         let cascaded = CascadedValues::new(cascaded, node);
         let values = cascaded.get();
 
-        drawing_ctx::with_discrete_layer(draw_ctx, node, values, clipping, &mut |_cr| {
+        draw_ctx.with_discrete_layer(node, values, clipping, &mut |dc| {
             if link.is_some() && link.as_ref().unwrap() != "" {
                 const CAIRO_TAG_LINK: &str = "Link";
 
                 let attributes = link.as_ref().map(|i| format!("uri='{}'", escape_value(i)));
 
-                drawing_ctx::get_cairo_context(draw_ctx).with_tag(
-                    CAIRO_TAG_LINK,
-                    attributes.as_ref().map(|i| i.as_str()),
-                    || {
-                        node.draw_children(&cascaded, draw_ctx, clipping);
-                    },
-                )
+                let cr = dc.get_cairo_context();
+
+                cr.tag_begin(CAIRO_TAG_LINK, attributes.as_ref().map(|i| i.as_str()));
+                node.draw_children(&cascaded, dc, clipping);
+                cr.tag_end(CAIRO_TAG_LINK);
             } else {
-                node.draw_children(&cascaded, draw_ctx, clipping)
+                node.draw_children(&cascaded, dc, clipping)
             }
         });
     }
@@ -98,16 +96,6 @@ extern "C" {
 trait CairoTagging {
     fn tag_begin(&self, tag_name: &str, attributes: Option<&str>);
     fn tag_end(&self, tag_name: &str);
-    fn with_tag<U, T>(&self, tag_name: &str, attributes: Option<&str>, f: U) -> T
-    where
-        U: Fn() -> T,
-    {
-        self.tag_begin(tag_name, attributes);
-        let result = f();
-        self.tag_end(tag_name);
-
-        result
-    }
 }
 
 impl CairoTagging for cairo::Context {

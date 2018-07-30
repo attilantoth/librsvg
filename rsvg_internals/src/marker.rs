@@ -6,14 +6,12 @@ use cssparser::{CowRcStr, Parser, Token};
 
 use aspect_ratio::*;
 use attributes::Attribute;
-use draw::add_clipping_rect;
-use drawing_ctx;
-use drawing_ctx::RsvgDrawingCtx;
+use drawing_ctx::DrawingCtx;
 use error::*;
 use float_eq_cairo::ApproxEqCairo;
 use handle::RsvgHandle;
 use iri::IRI;
-use length::{LengthDir, RsvgLength};
+use length::{Length, LengthDir};
 use node::*;
 use parsers;
 use parsers::ParseError;
@@ -92,10 +90,10 @@ impl Parse for MarkerOrient {
 
 pub struct NodeMarker {
     units: Cell<MarkerUnits>,
-    ref_x: Cell<RsvgLength>,
-    ref_y: Cell<RsvgLength>,
-    width: Cell<RsvgLength>,
-    height: Cell<RsvgLength>,
+    ref_x: Cell<Length>,
+    ref_y: Cell<Length>,
+    width: Cell<Length>,
+    height: Cell<Length>,
     orient: Cell<MarkerOrient>,
     aspect: Cell<AspectRatio>,
     vbox: Cell<Option<ViewBox>>,
@@ -105,8 +103,8 @@ impl NodeMarker {
     pub fn new() -> NodeMarker {
         NodeMarker {
             units: Cell::new(MarkerUnits::default()),
-            ref_x: Cell::new(RsvgLength::default()),
-            ref_y: Cell::new(RsvgLength::default()),
+            ref_x: Cell::new(Length::default()),
+            ref_y: Cell::new(Length::default()),
             width: Cell::new(NodeMarker::get_default_size(LengthDir::Horizontal)),
             height: Cell::new(NodeMarker::get_default_size(LengthDir::Vertical)),
             orient: Cell::new(MarkerOrient::default()),
@@ -115,15 +113,15 @@ impl NodeMarker {
         }
     }
 
-    fn get_default_size(dir: LengthDir) -> RsvgLength {
+    fn get_default_size(dir: LengthDir) -> Length {
         // per the spec
-        RsvgLength::parse_str("3", dir).unwrap()
+        Length::parse_str("3", dir).unwrap()
     }
 
     fn render(
         &self,
         node: &RsvgNode,
-        draw_ctx: *mut RsvgDrawingCtx,
+        draw_ctx: &mut DrawingCtx,
         xpos: f64,
         ypos: f64,
         computed_angle: f64,
@@ -142,7 +140,7 @@ impl NodeMarker {
             return;
         }
 
-        let cr = drawing_ctx::get_cairo_context(draw_ctx);
+        let cr = draw_ctx.get_cairo_context();
         cr.save();
 
         let mut affine = cr.get_matrix();
@@ -172,9 +170,9 @@ impl NodeMarker {
 
             affine.scale(w / vbox.0.width, h / vbox.0.height);
 
-            drawing_ctx::push_view_box(draw_ctx, vbox.0.width, vbox.0.height);
+            draw_ctx.push_view_box(vbox.0.width, vbox.0.height);
         } else {
-            drawing_ctx::push_view_box(draw_ctx, marker_width, marker_height);
+            draw_ctx.push_view_box(marker_width, marker_height);
         }
 
         affine.translate(
@@ -186,17 +184,17 @@ impl NodeMarker {
 
         if !values.is_overflow() {
             if let Some(vbox) = self.vbox.get() {
-                add_clipping_rect(draw_ctx, vbox.0.x, vbox.0.y, vbox.0.width, vbox.0.height);
+                draw_ctx.clip(vbox.0.x, vbox.0.y, vbox.0.width, vbox.0.height);
             } else {
-                add_clipping_rect(draw_ctx, 0.0, 0.0, marker_width, marker_height);
+                draw_ctx.clip(0.0, 0.0, marker_width, marker_height);
             }
         }
 
-        drawing_ctx::with_discrete_layer(draw_ctx, node, values, clipping, &mut |_cr| {
-            node.draw_children(&cascaded, draw_ctx, clipping);
+        draw_ctx.with_discrete_layer(node, values, clipping, &mut |dc| {
+            node.draw_children(&cascaded, dc, clipping);
         });
 
-        drawing_ctx::pop_view_box(draw_ctx);
+        draw_ctx.pop_view_box();
 
         cr.restore();
     }
@@ -220,14 +218,14 @@ impl NodeTrait for NodeMarker {
                     "markerWidth",
                     value,
                     LengthDir::Horizontal,
-                    RsvgLength::check_nonnegative,
+                    Length::check_nonnegative,
                 )?),
 
                 Attribute::MarkerHeight => self.height.set(parse_and_validate(
                     "markerHeight",
                     value,
                     LengthDir::Vertical,
-                    RsvgLength::check_nonnegative,
+                    Length::check_nonnegative,
                 )?),
 
                 Attribute::Orient => self.orient.set(parse("orient", value, ())?),
@@ -584,7 +582,7 @@ enum MarkerType {
 }
 
 fn emit_marker_by_name(
-    draw_ctx: *mut RsvgDrawingCtx,
+    draw_ctx: &mut DrawingCtx,
     name: &str,
     xpos: f64,
     ypos: f64,
@@ -592,9 +590,7 @@ fn emit_marker_by_name(
     line_width: f64,
     clipping: bool,
 ) {
-    if let Some(acquired) =
-        drawing_ctx::get_acquired_node_of_type(draw_ctx, Some(name), NodeType::Marker)
-    {
+    if let Some(acquired) = draw_ctx.get_acquired_node_of_type(Some(name), NodeType::Marker) {
         let node = acquired.get();
 
         node.with_impl(|marker: &NodeMarker| {
@@ -640,7 +636,7 @@ fn emit_marker<E>(
 
 pub fn render_markers_for_path_builder(
     builder: &PathBuilder,
-    draw_ctx: *mut RsvgDrawingCtx,
+    draw_ctx: &mut DrawingCtx,
     values: &ComputedValues,
     clipping: bool,
 ) {

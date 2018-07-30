@@ -1,9 +1,9 @@
+use cairo;
 use std::cell::Cell;
 use std::cell::RefCell;
 
 use attributes::Attribute;
-use draw::draw_path_builder;
-use drawing_ctx::{self, RsvgDrawingCtx};
+use drawing_ctx::DrawingCtx;
 use error::*;
 use handle::RsvgHandle;
 use length::*;
@@ -17,14 +17,24 @@ use state::ComputedValues;
 
 fn render_path_builder(
     builder: &PathBuilder,
-    draw_ctx: *mut RsvgDrawingCtx,
+    draw_ctx: &mut DrawingCtx,
     node: &RsvgNode,
     values: &ComputedValues,
     render_markers: bool,
     clipping: bool,
 ) {
-    drawing_ctx::with_discrete_layer(draw_ctx, node, values, clipping, &mut |_cr| {
-        draw_path_builder(draw_ctx, values, builder, clipping);
+    draw_ctx.with_discrete_layer(node, values, clipping, &mut |dc| {
+        let cr = dc.get_cairo_context();
+
+        dc.set_affine_on_cr(&cr);
+        builder.to_cairo(&cr);
+
+        if clipping {
+            cr.set_fill_rule(cairo::FillRule::from(values.clip_rule));
+        } else {
+            cr.set_fill_rule(cairo::FillRule::from(values.fill_rule));
+            dc.stroke_and_fill(&cr, values);
+        }
     });
 
     if render_markers {
@@ -37,7 +47,7 @@ fn render_ellipse(
     cy: f64,
     rx: f64,
     ry: f64,
-    draw_ctx: *mut RsvgDrawingCtx,
+    draw_ctx: &mut DrawingCtx,
     node: &RsvgNode,
     values: &ComputedValues,
     clipping: bool,
@@ -57,36 +67,36 @@ fn render_ellipse(
 
     builder.curve_to(
         cx + rx,
-        cy - arc_magic * ry,
+        cy + arc_magic * ry,
         cx + arc_magic * rx,
-        cy - ry,
+        cy + ry,
         cx,
-        cy - ry,
+        cy + ry,
     );
 
     builder.curve_to(
         cx - arc_magic * rx,
-        cy - ry,
+        cy + ry,
         cx - rx,
-        cy - arc_magic * ry,
+        cy + arc_magic * ry,
         cx - rx,
         cy,
     );
 
     builder.curve_to(
         cx - rx,
-        cy + arc_magic * ry,
+        cy - arc_magic * ry,
         cx - arc_magic * rx,
-        cy + ry,
+        cy - ry,
         cx,
-        cy + ry,
+        cy - ry,
     );
 
     builder.curve_to(
         cx + arc_magic * rx,
-        cy + ry,
+        cy - ry,
         cx + rx,
-        cy + arc_magic * ry,
+        cy - arc_magic * ry,
         cx + rx,
         cy,
     );
@@ -130,7 +140,7 @@ impl NodeTrait for NodePath {
         &self,
         node: &RsvgNode,
         cascaded: &CascadedValues,
-        draw_ctx: *mut RsvgDrawingCtx,
+        draw_ctx: &mut DrawingCtx,
         clipping: bool,
     ) {
         let values = cascaded.get();
@@ -195,7 +205,7 @@ impl NodeTrait for NodePoly {
         &self,
         node: &RsvgNode,
         cascaded: &CascadedValues,
-        draw_ctx: *mut RsvgDrawingCtx,
+        draw_ctx: &mut DrawingCtx,
         clipping: bool,
     ) {
         let values = cascaded.get();
@@ -221,19 +231,19 @@ impl NodeTrait for NodePoly {
 }
 
 pub struct NodeLine {
-    x1: Cell<RsvgLength>,
-    y1: Cell<RsvgLength>,
-    x2: Cell<RsvgLength>,
-    y2: Cell<RsvgLength>,
+    x1: Cell<Length>,
+    y1: Cell<Length>,
+    x2: Cell<Length>,
+    y2: Cell<Length>,
 }
 
 impl NodeLine {
     pub fn new() -> NodeLine {
         NodeLine {
-            x1: Cell::new(RsvgLength::default()),
-            y1: Cell::new(RsvgLength::default()),
-            x2: Cell::new(RsvgLength::default()),
-            y2: Cell::new(RsvgLength::default()),
+            x1: Cell::new(Length::default()),
+            y1: Cell::new(Length::default()),
+            x2: Cell::new(Length::default()),
+            y2: Cell::new(Length::default()),
         }
     }
 }
@@ -257,7 +267,7 @@ impl NodeTrait for NodeLine {
         &self,
         node: &RsvgNode,
         cascaded: &CascadedValues,
-        draw_ctx: *mut RsvgDrawingCtx,
+        draw_ctx: &mut DrawingCtx,
         clipping: bool,
     ) {
         let values = cascaded.get();
@@ -278,23 +288,23 @@ impl NodeTrait for NodeLine {
 
 pub struct NodeRect {
     // x, y, width, height
-    x: Cell<RsvgLength>,
-    y: Cell<RsvgLength>,
-    w: Cell<RsvgLength>,
-    h: Cell<RsvgLength>,
+    x: Cell<Length>,
+    y: Cell<Length>,
+    w: Cell<Length>,
+    h: Cell<Length>,
 
     // Radiuses for rounded corners
-    rx: Cell<Option<RsvgLength>>,
-    ry: Cell<Option<RsvgLength>>,
+    rx: Cell<Option<Length>>,
+    ry: Cell<Option<Length>>,
 }
 
 impl NodeRect {
     pub fn new() -> NodeRect {
         NodeRect {
-            x: Cell::new(RsvgLength::default()),
-            y: Cell::new(RsvgLength::default()),
-            w: Cell::new(RsvgLength::default()),
-            h: Cell::new(RsvgLength::default()),
+            x: Cell::new(Length::default()),
+            y: Cell::new(Length::default()),
+            w: Cell::new(Length::default()),
+            h: Cell::new(Length::default()),
 
             rx: Cell::new(None),
             ry: Cell::new(None),
@@ -312,13 +322,13 @@ impl NodeTrait for NodeRect {
                     "width",
                     value,
                     LengthDir::Horizontal,
-                    RsvgLength::check_nonnegative,
+                    Length::check_nonnegative,
                 )?),
                 Attribute::Height => self.h.set(parse_and_validate(
                     "height",
                     value,
                     LengthDir::Vertical,
-                    RsvgLength::check_nonnegative,
+                    Length::check_nonnegative,
                 )?),
 
                 Attribute::Rx => self.rx.set(
@@ -326,16 +336,12 @@ impl NodeTrait for NodeRect {
                         "rx",
                         value,
                         LengthDir::Horizontal,
-                        RsvgLength::check_nonnegative,
+                        Length::check_nonnegative,
                     ).map(Some)?,
                 ),
                 Attribute::Ry => self.ry.set(
-                    parse_and_validate(
-                        "ry",
-                        value,
-                        LengthDir::Vertical,
-                        RsvgLength::check_nonnegative,
-                    ).map(Some)?,
+                    parse_and_validate("ry", value, LengthDir::Vertical, Length::check_nonnegative)
+                        .map(Some)?,
                 ),
 
                 _ => (),
@@ -349,7 +355,7 @@ impl NodeTrait for NodeRect {
         &self,
         node: &RsvgNode,
         cascaded: &CascadedValues,
-        draw_ctx: *mut RsvgDrawingCtx,
+        draw_ctx: &mut DrawingCtx,
         clipping: bool,
     ) {
         let values = cascaded.get();
@@ -493,17 +499,17 @@ impl NodeTrait for NodeRect {
 }
 
 pub struct NodeCircle {
-    cx: Cell<RsvgLength>,
-    cy: Cell<RsvgLength>,
-    r: Cell<RsvgLength>,
+    cx: Cell<Length>,
+    cy: Cell<Length>,
+    r: Cell<Length>,
 }
 
 impl NodeCircle {
     pub fn new() -> NodeCircle {
         NodeCircle {
-            cx: Cell::new(RsvgLength::default()),
-            cy: Cell::new(RsvgLength::default()),
-            r: Cell::new(RsvgLength::default()),
+            cx: Cell::new(Length::default()),
+            cy: Cell::new(Length::default()),
+            r: Cell::new(Length::default()),
         }
     }
 }
@@ -518,7 +524,7 @@ impl NodeTrait for NodeCircle {
                     "r",
                     value,
                     LengthDir::Both,
-                    RsvgLength::check_nonnegative,
+                    Length::check_nonnegative,
                 )?),
 
                 _ => (),
@@ -532,7 +538,7 @@ impl NodeTrait for NodeCircle {
         &self,
         node: &RsvgNode,
         cascaded: &CascadedValues,
-        draw_ctx: *mut RsvgDrawingCtx,
+        draw_ctx: &mut DrawingCtx,
         clipping: bool,
     ) {
         let values = cascaded.get();
@@ -546,19 +552,19 @@ impl NodeTrait for NodeCircle {
 }
 
 pub struct NodeEllipse {
-    cx: Cell<RsvgLength>,
-    cy: Cell<RsvgLength>,
-    rx: Cell<RsvgLength>,
-    ry: Cell<RsvgLength>,
+    cx: Cell<Length>,
+    cy: Cell<Length>,
+    rx: Cell<Length>,
+    ry: Cell<Length>,
 }
 
 impl NodeEllipse {
     pub fn new() -> NodeEllipse {
         NodeEllipse {
-            cx: Cell::new(RsvgLength::default()),
-            cy: Cell::new(RsvgLength::default()),
-            rx: Cell::new(RsvgLength::default()),
-            ry: Cell::new(RsvgLength::default()),
+            cx: Cell::new(Length::default()),
+            cy: Cell::new(Length::default()),
+            rx: Cell::new(Length::default()),
+            ry: Cell::new(Length::default()),
         }
     }
 }
@@ -574,13 +580,13 @@ impl NodeTrait for NodeEllipse {
                     "rx",
                     value,
                     LengthDir::Horizontal,
-                    RsvgLength::check_nonnegative,
+                    Length::check_nonnegative,
                 )?),
                 Attribute::Ry => self.ry.set(parse_and_validate(
                     "ry",
                     value,
                     LengthDir::Vertical,
-                    RsvgLength::check_nonnegative,
+                    Length::check_nonnegative,
                 )?),
 
                 _ => (),
@@ -594,7 +600,7 @@ impl NodeTrait for NodeEllipse {
         &self,
         node: &RsvgNode,
         cascaded: &CascadedValues,
-        draw_ctx: *mut RsvgDrawingCtx,
+        draw_ctx: &mut DrawingCtx,
         clipping: bool,
     ) {
         let values = cascaded.get();

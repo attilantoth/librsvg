@@ -7,11 +7,10 @@ use std::collections::HashSet;
 use std::str::FromStr;
 
 use attributes::Attribute;
-use color::rgba_to_argb;
 use error::*;
 use handle::RsvgHandle;
 use iri::IRI;
-use length::{Dasharray, LengthDir, LengthUnit, RsvgLength};
+use length::{Dasharray, FontSizeSpec, Length, LengthDir, LengthUnit};
 use node::RsvgNode;
 use paint_server::PaintServer;
 use parsers::{Parse, ParseError};
@@ -99,6 +98,7 @@ pub struct SpecifiedValues {
     pub clip_rule: SpecifiedValue<ClipRule>,
     pub comp_op: SpecifiedValue<CompOp>,
     pub color: SpecifiedValue<Color>,
+    pub color_interpolation_filters: SpecifiedValue<ColorInterpolationFilters>,
     pub direction: SpecifiedValue<Direction>,
     pub display: SpecifiedValue<Display>,
     pub enable_background: SpecifiedValue<EnableBackground>,
@@ -143,9 +143,6 @@ pub struct SpecifiedValues {
     pub xml_space: SpecifiedValue<XmlSpace>, // not a property, but a non-presentation attribute
 }
 
-// Used to transfer pointers to a ComputedValues to the C code
-pub type RsvgComputedValues = *const ComputedValues;
-
 #[derive(Debug, Clone)]
 pub struct ComputedValues {
     pub baseline_shift: BaselineShift,
@@ -153,6 +150,7 @@ pub struct ComputedValues {
     pub clip_rule: ClipRule,
     pub comp_op: CompOp,
     pub color: Color,
+    pub color_interpolation_filters: ColorInterpolationFilters,
     pub direction: Direction,
     pub display: Display,
     pub enable_background: EnableBackground,
@@ -229,6 +227,7 @@ impl Default for ComputedValues {
             clip_path: Default::default(),
             clip_rule: Default::default(),
             color: Default::default(),
+            color_interpolation_filters: Default::default(),
             comp_op: Default::default(),
             direction: Default::default(),
             display: Default::default(),
@@ -289,6 +288,7 @@ impl SpecifiedValues {
         compute_value!(self, computed, clip_rule);
         compute_value!(self, computed, comp_op);
         compute_value!(self, computed, color);
+        compute_value!(self, computed, color_interpolation_filters);
         compute_value!(self, computed, direction);
         compute_value!(self, computed, display);
         compute_value!(self, computed, enable_background);
@@ -385,6 +385,10 @@ impl State {
                     self.values.color = parse_property(value, ())?;
                 }
 
+                Attribute::ColorInterpolationFilters => {
+                    self.values.color_interpolation_filters = parse_property(value, ())?;
+                }
+
                 Attribute::CompOp => {
                     self.values.comp_op = parse_property(value, ())?;
                 }
@@ -430,7 +434,7 @@ impl State {
                 }
 
                 Attribute::FontSize => {
-                    self.values.font_size = parse_property(value, LengthDir::Both)?;
+                    self.values.font_size = parse_property(value, ())?;
                 }
 
                 Attribute::FontStretch => {
@@ -671,8 +675,8 @@ where
 make_property!(
     ComputedValues,
     BaselineShift,
-    default: RsvgLength::parse_str("0.0", LengthDir::Both).unwrap(),
-    newtype: RsvgLength,
+    default: Length::parse_str("0.0", LengthDir::Both).unwrap(),
+    newtype: Length,
     property_impl: {
         impl Property<ComputedValues> for BaselineShift {
             fn inherits_automatically() -> bool {
@@ -680,15 +684,17 @@ make_property!(
             }
 
             fn compute(&self, v: &ComputedValues) -> Self {
+                let font_size = v.font_size.0.value();
+
                 // FIXME: this implementation has limitations:
                 // 1) we only handle 'percent' shifts, but it could also be an absolute offset
                 // 2) we should be able to normalize the lengths and add even if they have
                 //    different units, but at the moment that requires access to the draw_ctx
-                if self.0.unit != LengthUnit::Percent || v.baseline_shift.0.unit != v.font_size.0.unit {
-                    return BaselineShift(RsvgLength::new(v.baseline_shift.0.length, v.baseline_shift.0.unit, LengthDir::Both));
+                if self.0.unit != LengthUnit::Percent || v.baseline_shift.0.unit != font_size.unit {
+                    return BaselineShift(Length::new(v.baseline_shift.0.length, v.baseline_shift.0.unit, LengthDir::Both));
                 }
 
-                BaselineShift(RsvgLength::new(self.0.length * v.font_size.0.length + v.baseline_shift.0.length, v.font_size.0.unit, LengthDir::Both))
+                BaselineShift(Length::new(self.0.length * font_size.length + v.baseline_shift.0.length, font_size.unit, LengthDir::Both))
             }
         }
     },
@@ -710,15 +716,15 @@ make_property!(
                     if let Token::Ident(ref cow) = token {
                         match cow.as_ref() {
                             "baseline" => return Ok(BaselineShift(
-                                RsvgLength::new(0.0, LengthUnit::Percent, LengthDir::Both)
+                                Length::new(0.0, LengthUnit::Percent, LengthDir::Both)
                             )),
 
                             "sub" => return Ok(BaselineShift(
-                                RsvgLength::new(-0.2, LengthUnit::Percent, LengthDir::Both)
+                                Length::new(-0.2, LengthUnit::Percent, LengthDir::Both)
                             )),
 
                             "super" => return Ok(BaselineShift(
-                                RsvgLength::new(0.4, LengthUnit::Percent, LengthDir::Both),
+                                Length::new(0.4, LengthUnit::Percent, LengthDir::Both),
                             )),
 
                             _ => (),
@@ -728,7 +734,7 @@ make_property!(
 
                 parser.reset(&parser_state);
 
-                Ok(BaselineShift(RsvgLength::from_cssparser(parser, LengthDir::Both)?))
+                Ok(BaselineShift(Length::from_cssparser(parser, LengthDir::Both)?))
             }
         }
     }
@@ -770,6 +776,19 @@ make_property!(
     inherits_automatically: true,
     newtype_parse: cssparser::RGBA,
     parse_data_type: ()
+);
+
+// https://www.w3.org/TR/SVG11/painting.html#ColorInterpolationProperty
+make_property!(
+    ComputedValues,
+    ColorInterpolationFilters,
+    default: LinearRgb,
+    inherits_automatically: true,
+
+    identifiers:
+    "auto" => Auto,
+    "linearRGB" => LinearRgb,
+    "sRGB" => Srgb,
 );
 
 // https://gitlab.gnome.org/GNOME/librsvg/issues/268 - can we remove this property?
@@ -933,9 +952,9 @@ make_property!(
 make_property!(
     ComputedValues,
     FontSize,
-    default: RsvgLength::parse_str("12.0", LengthDir::Both).unwrap(),
-    newtype_parse: RsvgLength,
-    parse_data_type: LengthDir,
+    default: FontSizeSpec::Value(Length::parse_str("12.0", LengthDir::Both).unwrap()),
+    newtype_parse: FontSizeSpec,
+    parse_data_type: (),
     property_impl: {
         impl Property<ComputedValues> for FontSize {
             fn inherits_automatically() -> bool {
@@ -943,18 +962,7 @@ make_property!(
             }
 
             fn compute(&self, v: &ComputedValues) -> Self {
-                match self.0.unit {
-                    LengthUnit::Percent =>
-                        FontSize(RsvgLength::new(self.0.length * v.font_size.0.length, v.font_size.0.unit, LengthDir::Both)),
-
-                    LengthUnit::RelativeLarger =>
-                        FontSize(RsvgLength::new(v.font_size.0.length * 1.2, v.font_size.0.unit, LengthDir::Both)),
-
-                    LengthUnit::RelativeSmaller =>
-                        FontSize(RsvgLength::new(v.font_size.0.length / 1.2, v.font_size.0.unit, LengthDir::Both)),
-
-                    _ => self.clone(),
-                }
+                FontSize(self.0.compute(v))
             }
         }
     }
@@ -1033,9 +1041,9 @@ make_property!(
 make_property!(
     ComputedValues,
     LetterSpacing,
-    default: RsvgLength::default(),
+    default: Length::default(),
     inherits_automatically: true,
-    newtype_parse: RsvgLength,
+    newtype_parse: Length,
     parse_data_type: LengthDir
 );
 
@@ -1171,9 +1179,9 @@ make_property!(
 make_property!(
     ComputedValues,
     StrokeDashoffset,
-    default: RsvgLength::default(),
+    default: Length::default(),
     inherits_automatically: true,
-    newtype_parse: RsvgLength,
+    newtype_parse: Length,
     parse_data_type: LengthDir
 );
 
@@ -1227,9 +1235,9 @@ make_property!(
 make_property!(
     ComputedValues,
     StrokeWidth,
-    default: RsvgLength::parse_str("1.0", LengthDir::Both).unwrap(),
+    default: Length::parse_str("1.0", LengthDir::Both).unwrap(),
     inherits_automatically: true,
-    newtype_parse: RsvgLength,
+    newtype_parse: Length,
     parse_data_type: LengthDir
 );
 
@@ -1487,22 +1495,6 @@ extern "C" {
     ) -> glib_sys::gboolean;
 }
 
-#[no_mangle]
-pub extern "C" fn rsvg_parse_style_attrs(
-    handle: *const RsvgHandle,
-    raw_node: *const RsvgNode,
-    tag: *const libc::c_char,
-    pbag: *const PropertyBag,
-) {
-    assert!(!raw_node.is_null());
-    let node: &RsvgNode = unsafe { &*raw_node };
-
-    let tag = unsafe { utf8_cstr(tag) };
-    let pbag = unsafe { &*pbag };
-
-    parse_style_attrs(handle, node, tag, pbag);
-}
-
 // Sets the node's state from the attributes in the pbag.  Also
 // applies CSS rules in our limited way based on the node's
 // tag/klazz/id.
@@ -1554,33 +1546,30 @@ pub fn parse_style_attrs(
                     // tag.class#id
                     if let Some(id) = node.get_id() {
                         let target = format!("{}.{}#{}", tag, cls, id);
-                        found = found
-                            || from_glib(rsvg_lookup_apply_css_style(
-                                handle,
-                                target.to_glib_none().0,
-                                to_c_mut(state),
-                            ));
+                        found = found || from_glib(rsvg_lookup_apply_css_style(
+                            handle,
+                            target.to_glib_none().0,
+                            to_c_mut(state),
+                        ));
                     }
 
                     // .class#id
                     if let Some(id) = node.get_id() {
                         let target = format!(".{}#{}", cls, id);
-                        found = found
-                            || from_glib(rsvg_lookup_apply_css_style(
-                                handle,
-                                target.to_glib_none().0,
-                                to_c_mut(state),
-                            ));
-                    }
-
-                    // tag.class
-                    let target = format!("{}.{}", tag, cls);
-                    found = found
-                        || from_glib(rsvg_lookup_apply_css_style(
+                        found = found || from_glib(rsvg_lookup_apply_css_style(
                             handle,
                             target.to_glib_none().0,
                             to_c_mut(state),
                         ));
+                    }
+
+                    // tag.class
+                    let target = format!("{}.{}", tag, cls);
+                    found = found || from_glib(rsvg_lookup_apply_css_style(
+                        handle,
+                        target.to_glib_none().0,
+                        to_c_mut(state),
+                    ));
 
                     if !found {
                         // didn't find anything more specific, just apply the class style
@@ -1617,16 +1606,5 @@ pub fn parse_style_attrs(
                 _ => (),
             }
         }
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn rsvg_computed_values_get_lighting_color_argb(values: RsvgComputedValues) -> u32 {
-    assert!(!values.is_null());
-    let values = unsafe { &*values };
-
-    match values.lighting_color {
-        LightingColor(cssparser::Color::CurrentColor) => rgba_to_argb(values.color.0),
-        LightingColor(cssparser::Color::RGBA(ref rgba)) => rgba_to_argb(*rgba),
     }
 }

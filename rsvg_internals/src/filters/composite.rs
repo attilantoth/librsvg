@@ -4,18 +4,23 @@ use cairo::{self, ImageSurface};
 use cssparser::{CowRcStr, Parser, Token};
 
 use attributes::Attribute;
+use drawing_ctx::DrawingCtx;
 use error::{AttributeError, NodeError};
 use handle::RsvgHandle;
-use node::{NodeResult, NodeTrait, RsvgCNodeImpl, RsvgNode};
+use node::{NodeResult, NodeTrait, RsvgNode};
 use parsers::{self, parse, Parse};
 use property_bag::PropertyBag;
-use srgb::{linearize_surface, unlinearize_surface};
+use surface_utils::{
+    iterators::Pixels,
+    shared_surface::SharedImageSurface,
+    ImageSurfaceDataExt,
+    Pixel,
+};
 use util::clamp;
 
 use super::context::{FilterContext, FilterOutput, FilterResult};
 use super::input::Input;
-use super::iterators::{ImageSurfaceDataExt, ImageSurfaceDataShared, Pixel, Pixels};
-use super::{make_result, Filter, FilterError, PrimitiveWithInput};
+use super::{Filter, FilterError, PrimitiveWithInput};
 
 /// Enumeration of the possible compositing operations.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -88,50 +93,47 @@ impl NodeTrait for Composite {
 
         Ok(())
     }
-
-    #[inline]
-    fn get_c_impl(&self) -> *const RsvgCNodeImpl {
-        self.base.get_c_impl()
-    }
 }
 
 impl Filter for Composite {
-    fn render(&self, _node: &RsvgNode, ctx: &FilterContext) -> Result<FilterResult, FilterError> {
-        let input = make_result(self.base.get_input(ctx))?;
-        let input_2 = make_result(ctx.get_input(self.in2.borrow().as_ref()))?;
+    fn render(
+        &self,
+        _node: &RsvgNode,
+        ctx: &FilterContext,
+        draw_ctx: &mut DrawingCtx,
+    ) -> Result<FilterResult, FilterError> {
+        let input = self.base.get_input(ctx, draw_ctx)?;
+        let input_2 = ctx.get_input(draw_ctx, self.in2.borrow().as_ref())?;
         let bounds = self
             .base
             .get_bounds(ctx)
             .add_input(&input)
             .add_input(&input_2)
-            .into_irect();
+            .into_irect(draw_ctx);
 
-        // It's important to linearize sRGB before doing any blending, since otherwise the colors
-        // will be darker than they should be.
-        let input_surface =
-            linearize_surface(input.surface(), bounds).map_err(FilterError::BadInputSurfaceStatus)?;
+        // If we're combining two alpha-only surfaces, the result is alpha-only. Otherwise the
+        // result is whatever the non-alpha-only type we're working on (which can be either sRGB or
+        // linear sRGB depending on color-interpolation-filters).
+        let surface_type = if input.surface().is_alpha_only() {
+            input_2.surface().surface_type()
+        } else {
+            if !input_2.surface().is_alpha_only() {
+                // All surface types should match (this is enforced by get_input()).
+                assert_eq!(
+                    input_2.surface().surface_type(),
+                    input.surface().surface_type()
+                );
+            }
+
+            input.surface().surface_type()
+        };
 
         let output_surface = if self.operator.get() == Operator::Arithmetic {
-            let input_data = unsafe {
-                ImageSurfaceDataShared::new_unchecked(&input_surface)
-                    .map_err(FilterError::BadInputSurfaceStatus)?
-            };
-
-            // Not linearizing input_2 gives a better matching result than linearizing?..
-            // Maybe it's due to some issue elsewhere? Am I missing something?
-            //
-            // let input_2_surface = linearize_surface(input_2.surface(), bounds)
-            //     .map_err(FilterError::BadInputSurfaceStatus)?;
-            let input_2_data = unsafe {
-                ImageSurfaceDataShared::new_unchecked(&input_2.surface())
-                    .map_err(FilterError::BadInputSurfaceStatus)?
-            };
-
             let mut output_surface = ImageSurface::create(
                 cairo::Format::ARgb32,
-                input_data.width as i32,
-                input_data.height as i32,
-            ).map_err(FilterError::OutputSurfaceCreation)?;
+                input.surface().width(),
+                input.surface().height(),
+            )?;
 
             let output_stride = output_surface.get_stride() as usize;
             {
@@ -142,8 +144,8 @@ impl Filter for Composite {
                 let k3 = self.k3.get();
                 let k4 = self.k4.get();
 
-                for (x, y, pixel, pixel_2) in Pixels::new(input_data, bounds)
-                    .map(|(x, y, p)| (x, y, p, input_2_data.get_pixel(x, y)))
+                for (x, y, pixel, pixel_2) in Pixels::new(input.surface(), bounds)
+                    .map(|(x, y, p)| (x, y, p, input_2.surface().get_pixel(x, y)))
                 {
                     let i1a = f64::from(pixel.a) / 255f64;
                     let i2a = f64::from(pixel_2.a) / 255f64;
@@ -177,8 +179,7 @@ impl Filter for Composite {
 
             output_surface
         } else {
-            let output_surface = linearize_surface(&input_2.surface(), bounds)
-                .map_err(FilterError::BadInputSurfaceStatus)?;
+            let output_surface = input_2.surface().copy_surface(bounds)?;
 
             let cr = cairo::Context::new(&output_surface);
             cr.rectangle(
@@ -189,23 +190,25 @@ impl Filter for Composite {
             );
             cr.clip();
 
-            cr.set_source_surface(&input_surface, 0f64, 0f64);
+            input.surface().set_as_source_surface(&cr, 0f64, 0f64);
             cr.set_operator(self.operator.get().into());
             cr.paint();
 
             output_surface
         };
 
-        let output_surface = unlinearize_surface(&output_surface, bounds)
-            .map_err(FilterError::OutputSurfaceCreation)?;
-
         Ok(FilterResult {
             name: self.base.result.borrow().clone(),
             output: FilterOutput {
-                surface: output_surface,
+                surface: SharedImageSurface::new(output_surface, surface_type)?,
                 bounds,
             },
         })
+    }
+
+    #[inline]
+    fn is_affected_by_color_interpolation_filters(&self) -> bool {
+        true
     }
 }
 

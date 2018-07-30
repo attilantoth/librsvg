@@ -20,19 +20,6 @@ enum_sources = 				\
 BUILT_SOURCES += $(enum_sources)
 
 librsvg_@RSVG_API_MAJOR_VERSION@_la_SOURCES =	\
-	librsvg/filters/common.c		\
-	librsvg/filters/common.h		\
-	librsvg/filters/color_matrix.c		\
-	librsvg/filters/convolve_matrix.c	\
-	librsvg/filters/diffuse_lighting.c	\
-	librsvg/filters/displacement_map.c	\
-	librsvg/filters/erode.c			\
-	librsvg/filters/gaussian_blur.c		\
-	librsvg/filters/light_source.c		\
-	librsvg/filters/light_source.h		\
-	librsvg/filters/specular_lighting.c	\
-	librsvg/filters/tile.c			\
-	librsvg/filters/turbulence.c		\
 	librsvg/librsvg-enum-types.c		\
 	librsvg/librsvg-enum-types.h		\
 	librsvg/librsvg-features.c 		\
@@ -40,98 +27,103 @@ librsvg_@RSVG_API_MAJOR_VERSION@_la_SOURCES =	\
 	librsvg/rsvg-attributes.h		\
 	librsvg/rsvg-base-file-util.c 		\
 	librsvg/rsvg-base.c			\
-	librsvg/rsvg-drawing-ctx.c		\
-	librsvg/rsvg-drawing-ctx.h		\
 	librsvg/rsvg-cairo.h			\
 	librsvg/rsvg-css.h 			\
 	librsvg/rsvg-defs.c 			\
 	librsvg/rsvg-defs.h 			\
 	librsvg/rsvg-file-util.c		\
-	librsvg/rsvg-filter.h			\
 	librsvg/rsvg-handle.c			\
 	librsvg/rsvg-io.c			\
 	librsvg/rsvg-io.h			\
 	librsvg/rsvg-load.c			\
 	librsvg/rsvg-load.h			\
-	librsvg/rsvg-paint-server.h 		\
 	librsvg/rsvg-private.h 			\
 	librsvg/rsvg-size-callback.c		\
 	librsvg/rsvg-size-callback.h		\
-	librsvg/rsvg-structure.h		\
 	librsvg/rsvg-styles.c			\
 	librsvg/rsvg-styles.h			\
-	librsvg/rsvg-xml.c			\
-	librsvg/rsvg-xml.h			\
 	librsvg/rsvg.h				\
 	$(NULL)
 
-RUST_SRC =					\
-	Cargo.toml				\
-	rsvg_internals/Cargo.toml		\
-	rsvg_internals/build.rs			\
-	rsvg_internals/src/aspect_ratio.rs	\
-	rsvg_internals/src/attributes.rs	\
-	rsvg_internals/src/bbox.rs		\
-	rsvg_internals/src/clip_path.rs		\
-	rsvg_internals/src/cnode.rs		\
-	rsvg_internals/src/color.rs		\
-	rsvg_internals/src/cond.rs		\
-	rsvg_internals/src/coord_units.rs	\
-	rsvg_internals/src/defs.rs		\
-	rsvg_internals/src/draw.rs		\
-	rsvg_internals/src/drawing_ctx.rs	\
-	rsvg_internals/src/filters/bounds.rs	\
-	rsvg_internals/src/filters/blend.rs	\
+RUST_SRC =							\
+	Cargo.toml						\
+	rsvg_internals/Cargo.toml				\
+	rsvg_internals/build.rs					\
+	rsvg_internals/src/aspect_ratio.rs			\
+	rsvg_internals/src/attributes.rs			\
+	rsvg_internals/src/bbox.rs				\
+	rsvg_internals/src/clip_path.rs				\
+	rsvg_internals/src/color.rs				\
+	rsvg_internals/src/cond.rs				\
+	rsvg_internals/src/coord_units.rs			\
+	rsvg_internals/src/defs.rs				\
+	rsvg_internals/src/drawing_ctx.rs			\
+	rsvg_internals/src/filters/bounds.rs			\
+	rsvg_internals/src/filters/blend.rs			\
+	rsvg_internals/src/filters/color_matrix.rs		\
 	rsvg_internals/src/filters/component_transfer.rs	\
-	rsvg_internals/src/filters/composite.rs	\
-	rsvg_internals/src/filters/context.rs	\
-	rsvg_internals/src/filters/error.rs	\
-	rsvg_internals/src/filters/ffi.rs	\
-	rsvg_internals/src/filters/flood.rs	\
-	rsvg_internals/src/filters/image.rs	\
-	rsvg_internals/src/filters/merge.rs	\
-	rsvg_internals/src/filters/mod.rs	\
-	rsvg_internals/src/filters/node.rs	\
-	rsvg_internals/src/filters/input.rs	\
-	rsvg_internals/src/filters/iterators.rs	\
-	rsvg_internals/src/filters/offset.rs	\
-	rsvg_internals/src/error.rs		\
-	rsvg_internals/src/float_eq_cairo.rs	\
-	rsvg_internals/src/gradient.rs		\
-	rsvg_internals/src/handle.rs		\
-	rsvg_internals/src/image.rs		\
-	rsvg_internals/src/iri.rs		\
-	rsvg_internals/src/length.rs		\
-	rsvg_internals/src/lib.rs		\
-	rsvg_internals/src/link.rs		\
-	rsvg_internals/src/load.rs		\
-	rsvg_internals/src/marker.rs		\
-	rsvg_internals/src/mask.rs		\
-	rsvg_internals/src/node.rs		\
-	rsvg_internals/src/paint_server.rs	\
-	rsvg_internals/src/parsers.rs		\
-	rsvg_internals/src/path_builder.rs	\
-	rsvg_internals/src/path_parser.rs	\
-	rsvg_internals/src/pattern.rs		\
-	rsvg_internals/src/property_bag.rs	\
-	rsvg_internals/src/property_macros.rs	\
-	rsvg_internals/src/rect.rs		\
-	rsvg_internals/src/shapes.rs		\
-	rsvg_internals/src/space.rs		\
-	rsvg_internals/src/srgb.rs		\
-	rsvg_internals/src/state.rs		\
-	rsvg_internals/src/stop.rs		\
-	rsvg_internals/src/structure.rs		\
-	rsvg_internals/src/text.rs		\
-	rsvg_internals/src/transform.rs		\
-	rsvg_internals/src/unitinterval.rs	\
-	rsvg_internals/src/util.rs		\
-	rsvg_internals/src/viewbox.rs		\
+	rsvg_internals/src/filters/composite.rs			\
+	rsvg_internals/src/filters/convolve_matrix.rs		\
+	rsvg_internals/src/filters/context.rs			\
+	rsvg_internals/src/filters/displacement_map.rs		\
+	rsvg_internals/src/filters/error.rs			\
+	rsvg_internals/src/filters/flood.rs			\
+	rsvg_internals/src/filters/gaussian_blur.rs		\
+	rsvg_internals/src/filters/image.rs			\
+	rsvg_internals/src/filters/light/diffuse_lighting.rs	\
+	rsvg_internals/src/filters/light/light_source.rs	\
+	rsvg_internals/src/filters/light/specular_lighting.rs	\
+	rsvg_internals/src/filters/light/mod.rs			\
+	rsvg_internals/src/filters/merge.rs			\
+	rsvg_internals/src/filters/morphology.rs		\
+	rsvg_internals/src/filters/mod.rs			\
+	rsvg_internals/src/filters/node.rs			\
+	rsvg_internals/src/filters/input.rs			\
+	rsvg_internals/src/filters/offset.rs			\
+	rsvg_internals/src/filters/tile.rs			\
+	rsvg_internals/src/filters/turbulence.rs		\
+	rsvg_internals/src/error.rs				\
+	rsvg_internals/src/float_eq_cairo.rs			\
+	rsvg_internals/src/gradient.rs				\
+	rsvg_internals/src/handle.rs				\
+	rsvg_internals/src/image.rs				\
+	rsvg_internals/src/iri.rs				\
+	rsvg_internals/src/length.rs				\
+	rsvg_internals/src/lib.rs				\
+	rsvg_internals/src/link.rs				\
+	rsvg_internals/src/load.rs				\
+	rsvg_internals/src/marker.rs				\
+	rsvg_internals/src/mask.rs				\
+	rsvg_internals/src/node.rs				\
+	rsvg_internals/src/paint_server.rs			\
+	rsvg_internals/src/parsers.rs				\
+	rsvg_internals/src/path_builder.rs			\
+	rsvg_internals/src/path_parser.rs			\
+	rsvg_internals/src/pattern.rs				\
+	rsvg_internals/src/property_bag.rs			\
+	rsvg_internals/src/property_macros.rs			\
+	rsvg_internals/src/rect.rs				\
+	rsvg_internals/src/shapes.rs				\
+	rsvg_internals/src/surface_utils/iterators.rs		\
+	rsvg_internals/src/surface_utils/mod.rs			\
+	rsvg_internals/src/surface_utils/shared_surface.rs	\
+	rsvg_internals/src/space.rs				\
+	rsvg_internals/src/srgb.rs				\
+	rsvg_internals/src/state.rs				\
+	rsvg_internals/src/stop.rs				\
+	rsvg_internals/src/structure.rs				\
+	rsvg_internals/src/text.rs				\
+	rsvg_internals/src/transform.rs				\
+	rsvg_internals/src/unitinterval.rs			\
+	rsvg_internals/src/util.rs				\
+	rsvg_internals/src/viewbox.rs				\
 	rsvg_internals/src/viewport.rs
 
 RUST_EXTRA = 					\
 	Cargo.lock				\
-	cargo-vendor-config
+	cargo-vendor-config			\
+	rsvg_internals/benches/box_blur.rs	\
+	rsvg_internals/benches/pixel_iterators.rs
 
 if DEBUG_RELEASE
 CARGO_RELEASE_ARGS=

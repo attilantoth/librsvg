@@ -2,7 +2,8 @@
 use cairo::{self, MatrixTrait};
 
 use bbox::BoundingBox;
-use length::RsvgLength;
+use drawing_ctx::DrawingCtx;
+use length::Length;
 
 use super::context::{FilterContext, FilterInput, FilterOutput, IRect};
 
@@ -19,10 +20,10 @@ pub struct BoundsBuilder<'a> {
     standard_input_was_referenced: bool,
 
     /// Filter primitive properties.
-    x: Option<RsvgLength>,
-    y: Option<RsvgLength>,
-    width: Option<RsvgLength>,
-    height: Option<RsvgLength>,
+    x: Option<Length>,
+    y: Option<Length>,
+    width: Option<Length>,
+    height: Option<Length>,
 }
 
 impl<'a> BoundsBuilder<'a> {
@@ -30,10 +31,10 @@ impl<'a> BoundsBuilder<'a> {
     #[inline]
     pub fn new(
         ctx: &'a FilterContext,
-        x: Option<RsvgLength>,
-        y: Option<RsvgLength>,
-        width: Option<RsvgLength>,
-        height: Option<RsvgLength>,
+        x: Option<Length>,
+        y: Option<Length>,
+        width: Option<Length>,
+        height: Option<Length>,
     ) -> Self {
         Self {
             ctx,
@@ -82,13 +83,11 @@ impl<'a> BoundsBuilder<'a> {
 
     /// Returns the final pixel bounds.
     #[inline]
-    pub fn into_irect(self) -> IRect {
-        let (mut bbox, needs_clipping) = self.apply_properties();
+    pub fn into_irect(self, draw_ctx: &mut DrawingCtx) -> IRect {
+        let mut bbox = self.apply_properties(draw_ctx);
 
-        if needs_clipping {
-            let effects_region = self.ctx.effects_region();
-            bbox.clip(&effects_region);
-        }
+        let effects_region = self.ctx.effects_region();
+        bbox.clip(&effects_region);
 
         bbox.rect.unwrap().into()
     }
@@ -97,12 +96,12 @@ impl<'a> BoundsBuilder<'a> {
     ///
     /// Used by feImage.
     #[inline]
-    pub fn into_irect_without_clipping(self) -> IRect {
-        self.apply_properties().0.rect.unwrap().into()
+    pub fn into_irect_without_clipping(self, draw_ctx: &mut DrawingCtx) -> IRect {
+        self.apply_properties(draw_ctx).rect.unwrap().into()
     }
 
     /// Applies the filter primitive properties.
-    fn apply_properties(mut self) -> (BoundingBox, bool) {
+    fn apply_properties(mut self, draw_ctx: &mut DrawingCtx) -> BoundingBox {
         if self.bbox.rect.is_none() || self.standard_input_was_referenced {
             // The default value is the filter effects region.
             let effects_region = self.ctx.effects_region();
@@ -113,11 +112,9 @@ impl<'a> BoundsBuilder<'a> {
             self.bbox.insert(&effects_region);
         }
 
-        let mut needs_clipping = false;
-
         // If any of the properties were specified, we need to respect them.
         if self.x.is_some() || self.y.is_some() || self.width.is_some() || self.height.is_some() {
-            self.ctx.with_primitive_units(|normalize| {
+            self.ctx.with_primitive_units(draw_ctx, |normalize| {
                 // These replacements are correct only because self.bbox is used with the paffine
                 // matrix.
                 let rect = self.bbox.rect.as_mut().unwrap();
@@ -135,15 +132,11 @@ impl<'a> BoundsBuilder<'a> {
                     rect.height = normalize(&height);
                 }
             });
-
-            // x, y, width, height, on the other hand, can exceed the filter effects region, so a
-            // clip is needed.
-            needs_clipping = true;
         }
 
         // Convert into the surface coordinate system.
         let mut bbox = BoundingBox::new(&cairo::Matrix::identity());
         bbox.insert(&self.bbox);
-        (bbox, needs_clipping)
+        bbox
     }
 }

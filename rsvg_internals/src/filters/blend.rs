@@ -3,16 +3,17 @@ use std::cell::{Cell, RefCell};
 use cairo;
 
 use attributes::Attribute;
+use drawing_ctx::DrawingCtx;
 use error::NodeError;
 use handle::RsvgHandle;
-use node::{NodeResult, NodeTrait, RsvgCNodeImpl, RsvgNode};
+use node::{NodeResult, NodeTrait, RsvgNode};
 use parsers::ParseError;
 use property_bag::PropertyBag;
-use srgb::{linearize_surface, unlinearize_surface};
+use surface_utils::shared_surface::SharedImageSurface;
 
 use super::context::{FilterContext, FilterOutput, FilterResult};
 use super::input::Input;
-use super::{make_result, Filter, FilterError, PrimitiveWithInput};
+use super::{Filter, FilterError, PrimitiveWithInput};
 
 /// Enumeration of the possible blending modes.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -64,55 +65,69 @@ impl NodeTrait for Blend {
 
         Ok(())
     }
-
-    #[inline]
-    fn get_c_impl(&self) -> *const RsvgCNodeImpl {
-        self.base.get_c_impl()
-    }
 }
 
 impl Filter for Blend {
-    fn render(&self, _node: &RsvgNode, ctx: &FilterContext) -> Result<FilterResult, FilterError> {
-        let input = make_result(self.base.get_input(ctx))?;
-        let input_2 = make_result(ctx.get_input(self.in2.borrow().as_ref()))?;
+    fn render(
+        &self,
+        _node: &RsvgNode,
+        ctx: &FilterContext,
+        draw_ctx: &mut DrawingCtx,
+    ) -> Result<FilterResult, FilterError> {
+        let input = self.base.get_input(ctx, draw_ctx)?;
+        let input_2 = ctx.get_input(draw_ctx, self.in2.borrow().as_ref())?;
         let bounds = self
             .base
             .get_bounds(ctx)
             .add_input(&input)
             .add_input(&input_2)
-            .into_irect();
+            .into_irect(draw_ctx);
 
-        // It's important to linearize sRGB before doing any blending, since otherwise the colors
-        // will be darker than they should be.
-        let input_surface =
-            linearize_surface(input.surface(), bounds).map_err(FilterError::BadInputSurfaceStatus)?;
+        // If we're combining two alpha-only surfaces, the result is alpha-only. Otherwise the
+        // result is whatever the non-alpha-only type we're working on (which can be either sRGB or
+        // linear sRGB depending on color-interpolation-filters).
+        let surface_type = if input.surface().is_alpha_only() {
+            input_2.surface().surface_type()
+        } else {
+            if !input_2.surface().is_alpha_only() {
+                // All surface types should match (this is enforced by get_input()).
+                assert_eq!(
+                    input_2.surface().surface_type(),
+                    input.surface().surface_type()
+                );
+            }
 
-        let output_surface = linearize_surface(&input_2.surface(), bounds)
-            .map_err(FilterError::BadInputSurfaceStatus)?;
+            input.surface().surface_type()
+        };
 
-        let cr = cairo::Context::new(&output_surface);
-        cr.rectangle(
-            bounds.x0 as f64,
-            bounds.y0 as f64,
-            (bounds.x1 - bounds.x0) as f64,
-            (bounds.y1 - bounds.y0) as f64,
-        );
-        cr.clip();
+        let output_surface = input_2.surface().copy_surface(bounds)?;
+        {
+            let cr = cairo::Context::new(&output_surface);
+            cr.rectangle(
+                bounds.x0 as f64,
+                bounds.y0 as f64,
+                (bounds.x1 - bounds.x0) as f64,
+                (bounds.y1 - bounds.y0) as f64,
+            );
+            cr.clip();
 
-        cr.set_source_surface(&input_surface, 0f64, 0f64);
-        cr.set_operator(self.mode.get().into());
-        cr.paint();
-
-        let output_surface = unlinearize_surface(&output_surface, bounds)
-            .map_err(FilterError::OutputSurfaceCreation)?;
+            input.surface().set_as_source_surface(&cr, 0f64, 0f64);
+            cr.set_operator(self.mode.get().into());
+            cr.paint();
+        }
 
         Ok(FilterResult {
             name: self.base.result.borrow().clone(),
             output: FilterOutput {
-                surface: output_surface,
+                surface: SharedImageSurface::new(output_surface, surface_type)?,
                 bounds,
             },
         })
+    }
+
+    #[inline]
+    fn is_affected_by_color_interpolation_filters(&self) -> bool {
+        true
     }
 }
 

@@ -144,8 +144,10 @@ compare_surfaces (cairo_surface_t	*surface_a,
 static char *
 get_output_dir (void) {
     if (_output_dir == NULL) {
-        _output_dir = g_strconcat (g_get_current_dir (), G_DIR_SEPARATOR_S, "output", NULL);
+	char *cwd = g_get_current_dir ();
+        _output_dir = g_strconcat (cwd, G_DIR_SEPARATOR_S, "output", NULL);
         g_mkdir (_output_dir, 0777);
+	g_free (cwd);
     }
     return _output_dir;
 }
@@ -308,7 +310,10 @@ rsvg_cairo_check (gconstpointer data)
 
     rsvg_handle_internal_set_testing (rsvg, TRUE);
 
-    rsvg_handle_set_dpi_x_y (rsvg, 72.0, 72.0);
+    if (g_str_has_suffix (test_file_base, "-48dpi"))
+      rsvg_handle_set_dpi_x_y (rsvg, 48.0, 48.0);
+    else
+      rsvg_handle_set_dpi_x_y (rsvg, 72.0, 72.0);
     rsvg_handle_get_dimensions (rsvg, &dimensions);
     g_assert (dimensions.width > 0);
     g_assert (dimensions.height > 0);
