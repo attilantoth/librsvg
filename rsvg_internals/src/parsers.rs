@@ -4,9 +4,6 @@ use glib_sys;
 use libc;
 
 use std::f64::consts::*;
-use std::mem;
-use std::ptr;
-use std::slice;
 use std::str::{self, FromStr};
 
 use attributes::Attribute;
@@ -78,7 +75,7 @@ impl Parse for String {
 ///
 /// Some value types need some extra `data` to be parsed.  This
 /// corresponds to the `<T as Parse>::Data` associated type.  For
-/// example, an `RsvgLength` has an associated `type Data =
+/// example, an `Length` has an associated `type Data =
 /// LengthDir`, so to parse a length value, you could specify
 /// `LengthDir::Horizontal` for `data`, for example.
 pub fn parse<T>(key: &str, value: &str, data: <T as Parse>::Data) -> Result<T, NodeError>
@@ -96,7 +93,7 @@ where
 ///
 /// Some value types need some extra `data` to be parsed.  This
 /// corresponds to the `<T as Parse>::Data` associated type.  For
-/// example, an `RsvgLength` has an associated `type Data =
+/// example, an `Length` has an associated `type Data =
 /// LengthDir`, so to parse a length value, you could specify
 /// `LengthDir::Horizontal` for `data`, for example.
 pub fn parse_and_validate<T, F>(
@@ -199,6 +196,43 @@ pub fn number_optional_number(s: &str) -> Result<(f64, f64), ParseError> {
     }
 }
 
+// integer
+//
+// https://www.w3.org/TR/SVG11/types.html#DataTypeInteger
+pub fn integer(s: &str) -> Result<i32, ParseError> {
+    let mut input = ParserInput::new(s);
+    let mut parser = Parser::new(&mut input);
+
+    Ok(parser.expect_integer()?)
+}
+
+// integer-optional-integer
+//
+// Like number-optional-number but with integers.
+pub fn integer_optional_integer(s: &str) -> Result<(i32, i32), ParseError> {
+    let mut input = ParserInput::new(s);
+    let mut parser = Parser::new(&mut input);
+
+    let x = parser.expect_integer()?;
+
+    if !parser.is_exhausted() {
+        let state = parser.state();
+
+        match *parser.next()? {
+            Token::Comma => {}
+            _ => parser.reset(&state),
+        };
+
+        let y = parser.expect_integer()?;
+
+        parser.expect_exhausted()?;
+
+        Ok((x, y))
+    } else {
+        Ok((x, x))
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn rsvg_css_parse_number_optional_number(
     s: *const libc::c_char,
@@ -266,7 +300,6 @@ pub fn list_of_points(string: &str) -> Result<Vec<(f64, f64)>, ParseError> {
 #[derive(Eq, PartialEq)]
 pub enum ListLength {
     Exact(usize),
-    Maximum(usize),
     Unbounded,
 }
 
@@ -281,10 +314,6 @@ pub fn number_list(parser: &mut Parser, length: ListLength) -> Result<Vec<f64>, 
 
     match length {
         ListLength::Exact(l) => {
-            assert!(l > 0);
-            n = Some(l);
-        }
-        ListLength::Maximum(l) => {
             assert!(l > 0);
             n = Some(l);
         }
@@ -308,11 +337,10 @@ pub fn number_list(parser: &mut Parser, length: ListLength) -> Result<Vec<f64>, 
             NumberListError::Parse(ParseError::new("expected number"))
         })?));
 
-        match length {
-            ListLength::Exact(l) | ListLength::Maximum(l) => if i + 1 == l {
+        if let ListLength::Exact(l) = length {
+            if i + 1 == l {
                 break;
-            },
-            _ => (),
+            }
         }
 
         if parser.is_exhausted() {
@@ -339,65 +367,6 @@ pub fn number_list_from_str(s: &str, length: ListLength) -> Result<Vec<f64>, Num
     let mut parser = Parser::new(&mut input);
 
     number_list(&mut parser, length)
-}
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone, PartialEq)]
-pub enum NumberListLength {
-    Exact,
-    Maximum,
-}
-
-#[no_mangle]
-pub extern "C" fn rsvg_css_parse_number_list(
-    in_str: *const libc::c_char,
-    nlength: NumberListLength,
-    size: libc::size_t,
-    out_list: *mut *const libc::c_double,
-    out_list_length: *mut libc::size_t,
-) -> glib_sys::gboolean {
-    assert!(!in_str.is_null());
-    assert!(!out_list.is_null());
-    assert!(!out_list_length.is_null());
-
-    let length = match nlength {
-        NumberListLength::Exact => ListLength::Exact(size),
-        NumberListLength::Maximum => ListLength::Maximum(size),
-    };
-
-    let s = unsafe { utf8_cstr(in_str) };
-
-    let result = number_list_from_str(s, length);
-
-    match result {
-        Ok(number_list) => {
-            let num_elems = number_list.len();
-
-            let c_array = unsafe {
-                glib_sys::g_malloc_n(num_elems, mem::size_of::<libc::c_double>())
-                    as *mut libc::c_double
-            };
-
-            let array = unsafe { slice::from_raw_parts_mut(c_array, num_elems) };
-
-            array.copy_from_slice(&number_list);
-
-            unsafe {
-                *out_list = c_array;
-                *out_list_length = num_elems;
-            }
-
-            true
-        }
-
-        Err(_) => {
-            unsafe {
-                *out_list = ptr::null();
-                *out_list_length = 0;
-            }
-            false
-        }
-    }.to_glib()
 }
 
 #[cfg(test)]
@@ -480,21 +449,6 @@ mod tests {
             Ok(vec![1.0, 2.0, 3.0, 4.0])
         );
 
-        assert_eq!(
-            number_list_from_str("5", ListLength::Maximum(1)),
-            Ok(vec![5.0])
-        );
-
-        assert_eq!(
-            number_list_from_str("1.0, -2.5", ListLength::Maximum(2)),
-            Ok(vec![1.0, -2.5])
-        );
-
-        assert_eq!(
-            number_list_from_str("5 6", ListLength::Maximum(3)),
-            Ok(vec![5.0, 6.0])
-        );
-
         assert_eq!(number_list_from_str("", ListLength::Unbounded), Ok(vec![]));
         assert_eq!(
             number_list_from_str("1, 2, 3.0, 4, 5", ListLength::Unbounded),
@@ -516,16 +470,52 @@ mod tests {
 
         // too many
         assert!(number_list_from_str("1 2", ListLength::Exact(1)).is_err());
-        assert!(number_list_from_str("1,2,3", ListLength::Maximum(2)).is_err());
 
         // extra token
         assert!(number_list_from_str("1,", ListLength::Exact(1)).is_err());
         assert!(number_list_from_str("1,", ListLength::Exact(1)).is_err());
-        assert!(number_list_from_str("1,", ListLength::Maximum(1)).is_err());
         assert!(number_list_from_str("1,", ListLength::Unbounded).is_err());
 
         // too few
         assert!(number_list_from_str("1", ListLength::Exact(2)).is_err());
         assert!(number_list_from_str("1 2", ListLength::Exact(3)).is_err());
+    }
+
+    #[test]
+    fn parses_integer() {
+        assert_eq!(integer("1"), Ok(1));
+        assert_eq!(integer("-1"), Ok(-1));
+    }
+
+    #[test]
+    fn invalid_integer() {
+        assert!(integer("").is_err());
+        assert!(integer("1x").is_err());
+        assert!(integer("1.5").is_err());
+    }
+
+    #[test]
+    fn parses_integer_optional_integer() {
+        assert_eq!(integer_optional_integer("1, 2"), Ok((1, 2)));
+        assert_eq!(integer_optional_integer("1 2"), Ok((1, 2)));
+        assert_eq!(integer_optional_integer("1"), Ok((1, 1)));
+
+        assert_eq!(integer_optional_integer("-1, -2"), Ok((-1, -2)));
+        assert_eq!(integer_optional_integer("-1 -2"), Ok((-1, -2)));
+        assert_eq!(integer_optional_integer("-1"), Ok((-1, -1)));
+    }
+
+    #[test]
+    fn invalid_integer_optional_integer() {
+        assert!(integer_optional_integer("").is_err());
+        assert!(integer_optional_integer("1x").is_err());
+        assert!(integer_optional_integer("x1").is_err());
+        assert!(integer_optional_integer("1 x").is_err());
+        assert!(integer_optional_integer("1 , x").is_err());
+        assert!(integer_optional_integer("1 , 2x").is_err());
+        assert!(integer_optional_integer("1 2 x").is_err());
+        assert!(integer_optional_integer("1.5").is_err());
+        assert!(integer_optional_integer("1 2.5").is_err());
+        assert!(integer_optional_integer("1, 2.5").is_err());
     }
 }

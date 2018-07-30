@@ -12,8 +12,7 @@ variables:
   I386_DEBIAN_TESTING:       "registry.gitlab.gnome.org/gnome/librsvg-oci-images/i386/debian:testing"
   I386_UBUNTU_BIONIC:        "registry.gitlab.gnome.org/gnome/librsvg-oci-images/i386/ubuntu:18.04"
 
-  RUSTC_1_24:                "registry.gitlab.gnome.org/gnome/librsvg-oci-images/rustc:1.24"
-  RUSTC_1_25:                "registry.gitlab.gnome.org/gnome/librsvg-oci-images/rustc:1.25"
+  RUSTC_1_26:                "registry.gitlab.gnome.org/gnome/librsvg-oci-images/rustc:1.26"
 
   RUSTFMT_NIGHTLY:           "registry.gitlab.com/alatiera/rustfmt-oci-image/rustfmt:nightly"
   CLIPPY_NIGHTLY:            "registry.gitlab.gnome.org/gnome/librsvg-oci-images/clippy:nightly"
@@ -166,20 +165,8 @@ debian:testing:
   <<: *distro_test
   <<: *stage_2
 
-ubuntu:18.04:
-  image: $AMD64_UBUNTU_BIONIC
-  <<: *distro_test
-  <<: *stage_2
-
 debian_i386:testing:
   image: $I386_DEBIAN_TESTING
-  variables:
-    LIBRSVG_DEBUG: "yes"
-  <<: *distro_test
-  <<: *stage_2
-
-ubuntu_i386:18.04:
-  image: $I386_UBUNTU_BIONIC
   variables:
     LIBRSVG_DEBUG: "yes"
   <<: *distro_test
@@ -206,15 +193,8 @@ debian:testing_release_i386:
 # STAGE 3 RUSTC TESTS
 #######################################################################
 
-rustc:1_24:
-  image: $RUSTC_1_24
-  variables:
-    LIBRSVG_DEBUG: "yes"
-  <<: *rustc
-  <<: *stage_3
-
-rustc:1_25:
-  image: $RUSTC_1_25
+rustc:1_26:
+  image: $RUSTC_1_26
   variables:
     LIBRSVG_DEBUG: "yes"
   <<: *rustc

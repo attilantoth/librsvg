@@ -4,17 +4,22 @@ use std::cmp::min;
 use cairo::{self, ImageSurface};
 
 use attributes::Attribute;
+use drawing_ctx::DrawingCtx;
 use error::NodeError;
 use handle::RsvgHandle;
-use node::{NodeResult, NodeTrait, NodeType, RsvgCNodeImpl, RsvgNode};
+use node::{NodeResult, NodeTrait, NodeType, RsvgNode};
 use parsers::{self, ListLength, NumberListError, ParseError};
 use property_bag::PropertyBag;
-use srgb::{linearize_surface, unlinearize_surface};
+use surface_utils::{
+    iterators::Pixels,
+    shared_surface::SharedImageSurface,
+    ImageSurfaceDataExt,
+    Pixel,
+};
 use util::clamp;
 
 use super::context::{FilterContext, FilterOutput, FilterResult};
-use super::iterators::{ImageSurfaceDataExt, ImageSurfaceDataShared, Pixel, Pixels};
-use super::{make_result, Filter, FilterError, PrimitiveWithInput};
+use super::{Filter, FilterError, PrimitiveWithInput};
 
 /// The `feComponentTransfer` filter primitive.
 pub struct ComponentTransfer {
@@ -206,11 +211,6 @@ impl NodeTrait for ComponentTransfer {
     ) -> NodeResult {
         self.base.set_atts(node, handle, pbag)
     }
-
-    #[inline]
-    fn get_c_impl(&self) -> *const RsvgCNodeImpl {
-        self.base.get_c_impl()
-    }
 }
 
 impl NodeTrait for FuncX {
@@ -272,19 +272,25 @@ impl NodeTrait for FuncX {
 }
 
 impl Filter for ComponentTransfer {
-    fn render(&self, node: &RsvgNode, ctx: &FilterContext) -> Result<FilterResult, FilterError> {
-        let input = make_result(self.base.get_input(ctx))?;
-        let bounds = self.base.get_bounds(ctx).add_input(&input).into_irect();
-
-        let input_surface =
-            linearize_surface(input.surface(), bounds).map_err(FilterError::BadInputSurfaceStatus)?;
+    fn render(
+        &self,
+        node: &RsvgNode,
+        ctx: &FilterContext,
+        draw_ctx: &mut DrawingCtx,
+    ) -> Result<FilterResult, FilterError> {
+        let input = self.base.get_input(ctx, draw_ctx)?;
+        let bounds = self
+            .base
+            .get_bounds(ctx)
+            .add_input(&input)
+            .into_irect(draw_ctx);
 
         // Create the output surface.
         let mut output_surface = ImageSurface::create(
             cairo::Format::ARgb32,
-            ctx.source_graphic().get_width(),
-            ctx.source_graphic().get_height(),
-        ).map_err(FilterError::OutputSurfaceCreation)?;
+            ctx.source_graphic().width(),
+            ctx.source_graphic().height(),
+        )?;
 
         // Enumerate all child <feFuncX> nodes.
         let functions = node
@@ -344,15 +350,11 @@ impl Filter for ComponentTransfer {
         let compute_a = |alpha| compute_a(&params_a, alpha);
 
         // Do the actual processing.
-        let input_data = unsafe {
-            ImageSurfaceDataShared::new_unchecked(&input_surface)
-                .map_err(FilterError::BadInputSurfaceStatus)?
-        };
         let output_stride = output_surface.get_stride() as usize;
         {
             let mut output_data = output_surface.get_data().unwrap();
 
-            for (x, y, pixel) in Pixels::new(input_data, bounds) {
+            for (x, y, pixel) in Pixels::new(input.surface(), bounds) {
                 let alpha = f64::from(pixel.a) / 255f64;
                 let new_alpha = compute_a(alpha);
 
@@ -367,16 +369,17 @@ impl Filter for ComponentTransfer {
             }
         }
 
-        let output_surface = unlinearize_surface(&output_surface, bounds)
-            .map_err(FilterError::OutputSurfaceCreation)?;
-
         Ok(FilterResult {
             name: self.base.result.borrow().clone(),
             output: FilterOutput {
-                surface: output_surface,
+                surface: SharedImageSurface::new(output_surface, input.surface().surface_type())?,
                 bounds,
             },
         })
+    }
+
+    fn is_affected_by_color_interpolation_filters(&self) -> bool {
+        true
     }
 }
 

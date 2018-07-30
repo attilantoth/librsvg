@@ -1,6 +1,6 @@
 m4_define([rsvg_major_version],[2])
 m4_define([rsvg_minor_version],[43])
-m4_define([rsvg_micro_version],[1])
+m4_define([rsvg_micro_version],[2])
 m4_define([rsvg_extra_version],[])
 m4_define([rsvg_version],[rsvg_major_version.rsvg_minor_version.rsvg_micro_version()rsvg_extra_version])
 m4_define([rsvg_lt_version_info],m4_eval(rsvg_major_version + rsvg_minor_version):rsvg_micro_version:rsvg_minor_version)
@@ -86,7 +86,7 @@ AS_IF(test x$RUSTC = xno,
 dnl Minimum version of rustc that we support
 dnl If you change this, please update COMPILING.md
 MINIMUM_RUST_MAJOR=1
-MINIMUM_RUST_MINOR=24
+MINIMUM_RUST_MINOR=26
 
 rust_version=`rustc --version`
 version=`echo "$rust_version" | sed -e 's/^rustc //g'`

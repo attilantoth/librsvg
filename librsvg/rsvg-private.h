@@ -140,8 +140,6 @@ struct RsvgHandlePrivate {
 
     RsvgLoad *load;
 
-    gboolean is_disposed;
-
     RsvgSizeFunc size_func;
     gpointer user_data;
     GDestroyNotify user_data_destroy;
@@ -174,40 +172,6 @@ struct RsvgHandlePrivate {
     PangoFontMap *font_map_for_testing;
 #endif
 };
-
-/* Keep this in sync with rust/src/viewbox.rs::RsvgViewBox */
-typedef struct {
-    cairo_rectangle_t rect;
-    gboolean active;
-} RsvgViewBox;
-
-/* Opaque; defined in rsvg_internals/src/bbox.rs */
-typedef struct RsvgBbox RsvgBbox;
-
-/* Keep this in sync with rust/src/length.rs:LengthUnit */
-typedef enum {
-    LENGTH_UNIT_DEFAULT,
-    LENGTH_UNIT_PERCENT,
-    LENGTH_UNIT_FONT_EM,
-    LENGTH_UNIT_FONT_EX,
-    LENGTH_UNIT_INCH,
-    LENGTH_UNIT_RELATIVE_LARGER,
-    LENGTH_UNIT_RELATIVE_SMALLER
-} LengthUnit;
-
-/* Keep this in sync with rust/src/length.rs:LengthDir */
-typedef enum {
-    LENGTH_DIR_HORIZONTAL,
-    LENGTH_DIR_VERTICAL,
-    LENGTH_DIR_BOTH
-} LengthDir;
-
-/* Keep this in sync with rust/src/length.rs:RsvgLength */
-typedef struct {
-    double length;
-    LengthUnit unit;
-    LengthDir dir;
-} RsvgLength;
 
 typedef enum {
     userSpaceOnUse,
@@ -257,12 +221,12 @@ typedef enum {
     RSVG_NODE_TYPE_FILTER_PRIMITIVE_CONVOLVE_MATRIX,
     RSVG_NODE_TYPE_FILTER_PRIMITIVE_DIFFUSE_LIGHTING,
     RSVG_NODE_TYPE_FILTER_PRIMITIVE_DISPLACEMENT_MAP,
-    RSVG_NODE_TYPE_FILTER_PRIMITIVE_ERODE,
     RSVG_NODE_TYPE_FILTER_PRIMITIVE_FLOOD,
     RSVG_NODE_TYPE_FILTER_PRIMITIVE_GAUSSIAN_BLUR,
     RSVG_NODE_TYPE_FILTER_PRIMITIVE_IMAGE,
     RSVG_NODE_TYPE_FILTER_PRIMITIVE_MERGE,
     RSVG_NODE_TYPE_FILTER_PRIMITIVE_MERGE_NODE,
+    RSVG_NODE_TYPE_FILTER_PRIMITIVE_MORPHOLOGY,
     RSVG_NODE_TYPE_FILTER_PRIMITIVE_OFFSET,
     RSVG_NODE_TYPE_FILTER_PRIMITIVE_SPECULAR_LIGHTING,
     RSVG_NODE_TYPE_FILTER_PRIMITIVE_TILE,
@@ -270,26 +234,8 @@ typedef enum {
     RSVG_NODE_TYPE_FILTER_PRIMITIVE_LAST                /* just a marker; not a valid type */
 } RsvgNodeType;
 
-/* Defined in rsvg_internals/src/state.rs */
-typedef struct _RsvgComputedValues *RsvgComputedValues;
-
 typedef void (* CNodeSetAtts) (RsvgNode *node, gpointer impl, RsvgHandle *handle, RsvgPropertyBag pbag);
 typedef void (* CNodeFree) (gpointer impl);
-
-/* Implemented in rust/src/node.rs */
-/* Call node = rsvg_node_unref (node) when you are done with the node */
-G_GNUC_INTERNAL
-RsvgNode *rsvg_rust_cnode_new (RsvgNodeType  node_type,
-                               RsvgNode     *parent,
-                               const char   *id,
-                               const char   *klass,
-                               gpointer      impl,
-                               CNodeSetAtts  set_atts_fn,
-                               CNodeFree     free_fn) G_GNUC_WARN_UNUSED_RESULT;
-
-/* Implemented in rust/src/node.rs */
-G_GNUC_INTERNAL
-gpointer rsvg_rust_cnode_get_impl (RsvgNode *node);
 
 /* Implemented in rust/src/node.rs */
 G_GNUC_INTERNAL
@@ -323,10 +269,6 @@ void rsvg_node_add_child (RsvgNode *node, RsvgNode *child);
 
 /* Implemented in rust/src/node.rs */
 G_GNUC_INTERNAL
-void rsvg_node_set_atts (RsvgNode *node, RsvgHandle *handle, RsvgPropertyBag atts);
-
-/* Implemented in rust/src/node.rs */
-G_GNUC_INTERNAL
 void rsvg_node_set_overridden_properties (RsvgNode *node);
 
 /* Implemented in rust/src/node.rs */
@@ -353,17 +295,9 @@ gboolean rsvg_node_children_iter_next_back (RsvgNodeChildrenIter *iter,
 G_GNUC_INTERNAL
 void rsvg_node_children_iter_end (RsvgNodeChildrenIter *iter);
 
-/* Implemented in rust/src/state.rs */
+/* Implemented in rsvg_internals/src/structure.rs */
 G_GNUC_INTERNAL
-guint32 rsvg_computed_values_get_flood_color_argb (RsvgComputedValues *values);
-
-/* Implemented in rust/src/state.rs */
-G_GNUC_INTERNAL
-guint8 rsvg_computed_values_get_flood_opacity (RsvgComputedValues *values);
-
-/* Implemented in rust/src/state.rs */
-G_GNUC_INTERNAL
-guint32 rsvg_computed_values_get_lighting_color_argb (RsvgComputedValues *values);
+gboolean rsvg_node_svg_get_size (RsvgNode *node, double dpi_x, double dpi_y, int *out_width, int *out_height);
 
 typedef void (*RsvgPropertyBagEnumFunc) (const char *key, const char *value, gpointer user_data);
 
@@ -418,42 +352,37 @@ GdkPixbuf *rsvg_cairo_surface_to_pixbuf (cairo_surface_t *surface);
 G_GNUC_INTERNAL
 cairo_surface_t *rsvg_cairo_surface_new_from_href (RsvgHandle *handle, const char *href, GError ** error);
 
-/* Implemented in rust/src/bbox.rs */
+/* Defined in rsvg_internals/src/drawing_ctx.rs */
 G_GNUC_INTERNAL
-RsvgBbox *rsvg_bbox_new (cairo_matrix_t *matrix, cairo_rectangle_t *rect, cairo_rectangle_t *ink_rect);
+RsvgDrawingCtx *rsvg_drawing_ctx_new (cairo_t *cr,
+                                      guint width,
+                                      guint height,
+                                      double vb_width,
+                                      double vb_height,
+                                      double dpi_x,
+                                      double dpi_y,
+                                      RsvgDefs *defs,
+                                      gboolean testing);
 
-/* Implemented in rust/src/bbox.rs */
-void rsvg_bbox_free (RsvgBbox *bbox);
-
-/* Implemented in rust/src/bbox.rs */
-RsvgBbox *rsvg_bbox_clone (RsvgBbox *bbox);
-
-/* Implemented in rust/src/bbox.rs */
+/* Defined in rsvg_internals/src/drawing_ctx.rs */
 G_GNUC_INTERNAL
-void rsvg_bbox_insert (RsvgBbox *dst, RsvgBbox *src);
+void rsvg_drawing_ctx_free (RsvgDrawingCtx *draw_ctx);
 
-/* Implemented in rust/src/bbox.rs */
+/* Defined in rsvg_internals/src/drawing_ctx.rs */
 G_GNUC_INTERNAL
-void rsvg_bbox_clip (RsvgBbox *dst, RsvgBbox *src);
+void rsvg_drawing_ctx_add_node_and_ancestors_to_stack (RsvgDrawingCtx *draw_ctx,
+                                                       RsvgNode        *node);
 
-/* Implemented in rust/src/bbox.rs */
+/* Defined in rsvg_internals/src/drawing_ctx.rs */
 G_GNUC_INTERNAL
-void rsvg_bbox_get_rect (RsvgBbox *bbox, cairo_rectangle_t *rect, cairo_rectangle_t *ink_rect);
+void rsvg_drawing_ctx_draw_node_from_stack (RsvgDrawingCtx *ctx,
+                                            RsvgNode *node,
+                                            RsvgNode *cascade_from_node,
+                                            gboolean clipping);
 
-/* This is implemented in rust/src/length.rs */
+/* Defined in rsvg_internals/src/drawing_ctx.rs */
 G_GNUC_INTERNAL
-double rsvg_length_normalize (const RsvgLength *length, RsvgComputedValues *values, RsvgDrawingCtx * ctx);
-
-/* This is implemented in rust/src/length.rs */
-G_GNUC_INTERNAL
-double rsvg_length_hand_normalize (const RsvgLength *length,
-                                   double pixels_per_inch,
-                                   double width_or_height,
-                                   double font_size);
-
-/* Implemented in rust/src/length.rs */
-G_GNUC_INTERNAL
-RsvgLength rsvg_length_parse (const char *str, LengthDir dir);
+void rsvg_drawing_ctx_get_ink_rect (RsvgDrawingCtx *ctx, cairo_rectangle_t *ink_rect);
 
 /* Implemented in rust/src/node.rs */
 G_GNUC_INTERNAL

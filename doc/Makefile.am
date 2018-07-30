@@ -72,8 +72,6 @@ IGNORE_HFILES =			\
 	config.h		\
 	rsvg-attributes.h	\
 	rsvg-cairo-clip.h	\
-	rsvg-drawing-ctx.h	\
-	rsvg-cairo-render.h	\
 	rsvg-compat.h		\
 	rsvg-css.h		\
 	rsvg-defs.h		\
@@ -81,15 +79,10 @@ IGNORE_HFILES =			\
 	rsvg-io.h		\
 	rsvg-marker.h		\
 	rsvg-mask.h		\
-	rsvg-paint-server.h	\
-	rsvg-path-builder.h	\
 	rsvg-private.h		\
 	rsvg-shapes.h		\
 	rsvg-size-callback.h	\
-	rsvg-structure.h	\
-	rsvg-styles.h		\
-	rsvg-text.h		\
-	rsvg-xml.h
+	rsvg-styles.h
 
 # Images to copy into HTML directory.
 # e.g. HTML_IMAGES=$(top_srcdir)/gtk/stock-icons/stock_about_24.png

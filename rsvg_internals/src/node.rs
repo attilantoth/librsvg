@@ -13,8 +13,7 @@ use std::str::FromStr;
 use attributes::Attribute;
 use cond::{RequiredExtensions, RequiredFeatures, SystemLanguage};
 use defs::{self, RsvgDefs};
-use drawing_ctx;
-use drawing_ctx::RsvgDrawingCtx;
+use drawing_ctx::DrawingCtx;
 use error::*;
 use handle::RsvgHandle;
 use parsers::{Parse, ParseError};
@@ -35,10 +34,6 @@ use util::utf8_cstr;
 // points to an  Rc<Node>, which is our refcounted Rust representation
 // of nodes.
 pub type RsvgNode = Rc<Node>;
-
-// A *const RsvgCNodeImpl is just an opaque pointer to the C code's
-// struct for a particular node type.
-pub enum RsvgCNodeImpl {}
 
 /// Can obtain computed values from a node
 ///
@@ -128,18 +123,18 @@ pub trait NodeTrait: Downcast {
     /// from defaults in the node's `State`.
     fn set_overridden_properties(&self, _state: &mut State) {}
 
+    fn accept_chars(&self) -> bool {
+        false
+    }
+
     fn draw(
         &self,
         _node: &RsvgNode,
         _cascaded: &CascadedValues,
-        _draw_ctx: *mut RsvgDrawingCtx,
+        _draw_ctx: &mut DrawingCtx,
         _clipping: bool,
     ) {
         // by default nodes don't draw themselves
-    }
-
-    fn get_c_impl(&self) -> *const RsvgCNodeImpl {
-        unreachable!(); // no Rust nodes should have this method called for them
     }
 }
 
@@ -236,12 +231,12 @@ pub enum NodeType {
     FilterPrimitiveConvolveMatrix,
     FilterPrimitiveDiffuseLighting,
     FilterPrimitiveDisplacementMap,
-    FilterPrimitiveErode,
     FilterPrimitiveFlood,
     FilterPrimitiveGaussianBlur,
     FilterPrimitiveImage,
     FilterPrimitiveMerge,
     FilterPrimitiveMergeNode,
+    FilterPrimitiveMorphology,
     FilterPrimitiveOffset,
     FilterPrimitiveSpecularLighting,
     FilterPrimitiveTile,
@@ -335,7 +330,7 @@ impl Node {
         let mut desc = Some(descendant.clone());
 
         while let Some(ref d) = desc.clone() {
-            if rc_node_ptr_eq(&ancestor, d) {
+            if Rc::ptr_eq(&ancestor, d) {
                 return true;
             }
 
@@ -430,11 +425,11 @@ impl Node {
         &self,
         node: &RsvgNode,
         cascaded: &CascadedValues,
-        draw_ctx: *mut RsvgDrawingCtx,
+        draw_ctx: &mut DrawingCtx,
         clipping: bool,
     ) {
         if self.result.borrow().is_ok() {
-            let cr = drawing_ctx::get_cairo_context(draw_ctx);
+            let cr = draw_ctx.get_cairo_context();
             let save_affine = cr.get_matrix();
 
             cr.transform(self.get_transform());
@@ -457,10 +452,6 @@ impl Node {
         self.result.borrow().clone()
     }
 
-    pub fn get_c_impl(&self) -> *const RsvgCNodeImpl {
-        self.node_impl.get_c_impl()
-    }
-
     pub fn with_impl<T, F, U>(&self, f: F) -> U
     where
         T: NodeTrait,
@@ -480,16 +471,11 @@ impl Node {
     pub fn draw_children(
         &self,
         cascaded: &CascadedValues,
-        draw_ctx: *mut RsvgDrawingCtx,
+        draw_ctx: &mut DrawingCtx,
         clipping: bool,
     ) {
         for child in self.children() {
-            drawing_ctx::draw_node_from_stack(
-                draw_ctx,
-                &CascadedValues::new(cascaded, &child),
-                &child,
-                clipping,
-            );
+            draw_ctx.draw_node_from_stack(&CascadedValues::new(cascaded, &child), &child, clipping);
         }
     }
 
@@ -509,6 +495,30 @@ impl Node {
     pub fn set_overflow_hidden(&self) {
         let state = self.get_state_mut();
         state.values.overflow = SpecifiedValue::Specified(Overflow::Hidden);
+    }
+
+    pub fn accept_chars(&self) -> bool {
+        self.node_impl.accept_chars()
+    }
+
+    // find the last Chars node so that we can coalesce
+    // the text and avoid screwing up the Pango layouts
+    pub fn find_last_chars_child(&self) -> Option<Rc<Node>> {
+        for child in self.children().rev() {
+            match child.get_type() {
+                NodeType::Chars => return Some(child),
+
+                // If a node that accepts chars is encountered before
+                // any chars node (which means for instance that there
+                // is a tspan node after any chars nodes, because this
+                // is backwards iteration), return None.
+                _ if child.accept_chars() => return None,
+
+                _ => {}
+            }
+        }
+
+        None
     }
 }
 
@@ -647,15 +657,6 @@ pub extern "C" fn rsvg_node_unref(raw_node: *mut RsvgNode) -> *mut RsvgNode {
     ptr::null_mut()
 }
 
-// See https://github.com/rust-lang/rust/issues/36497 - this is what
-// added Rc::ptr_eq(), but we don't want to depend on unstable Rust
-// just yet.
-fn rc_node_ptr_eq<T: ?Sized>(this: &Rc<T>, other: &Rc<T>) -> bool {
-    let this_ptr: *const T = &**this;
-    let other_ptr: *const T = &**other;
-    this_ptr == other_ptr
-}
-
 #[no_mangle]
 pub extern "C" fn rsvg_node_is_same(
     raw_node1: *const RsvgNode,
@@ -667,7 +668,7 @@ pub extern "C" fn rsvg_node_is_same(
         let node1: &RsvgNode = unsafe { &*raw_node1 };
         let node2: &RsvgNode = unsafe { &*raw_node2 };
 
-        rc_node_ptr_eq(node1, node2)
+        Rc::ptr_eq(node1, node2)
     } else {
         false
     };
@@ -696,30 +697,6 @@ pub extern "C" fn rsvg_node_register_in_defs(raw_node: *const RsvgNode, defs: *m
 }
 
 #[no_mangle]
-pub extern "C" fn rsvg_node_set_atts(
-    raw_node: *mut RsvgNode,
-    handle: *const RsvgHandle,
-    pbag: *const PropertyBag,
-) {
-    assert!(!raw_node.is_null());
-    assert!(!pbag.is_null());
-
-    let node: &RsvgNode = unsafe { &*raw_node };
-    let pbag = unsafe { &*pbag };
-
-    node.set_atts(node, handle, pbag);
-}
-
-#[no_mangle]
-pub extern "C" fn rsvg_node_set_overridden_properties(raw_node: *mut RsvgNode) {
-    assert!(!raw_node.is_null());
-
-    let node: &RsvgNode = unsafe { &*raw_node };
-
-    node.set_overridden_properties();
-}
-
-#[no_mangle]
 pub extern "C" fn rsvg_node_set_attribute_parse_error(
     raw_node: *const RsvgNode,
     attr_name: *const libc::c_char,
@@ -740,6 +717,30 @@ pub extern "C" fn rsvg_node_set_attribute_parse_error(
             ParseError::new(&String::from_glib_none(description)),
         ));
     }
+}
+
+#[no_mangle]
+pub extern "C" fn rsvg_node_find_last_chars_child(
+    raw_node: *const RsvgNode,
+    out_accept_chars: *mut glib_sys::gboolean,
+) -> *mut RsvgNode {
+    assert!(!raw_node.is_null());
+    let node: &RsvgNode = unsafe { &*raw_node };
+
+    let accept_chars = node.accept_chars();
+
+    assert!(!out_accept_chars.is_null());
+    unsafe {
+        *out_accept_chars = accept_chars.to_glib();
+    }
+
+    if accept_chars {
+        if let Some(chars) = node.find_last_chars_child() {
+            return box_node(chars);
+        }
+    }
+
+    ptr::null_mut()
 }
 
 #[no_mangle]
@@ -766,27 +767,6 @@ pub extern "C" fn rsvg_node_children_iter_next(
 
     let iter = unsafe { &mut *iter };
     if let Some(child) = iter.next() {
-        unsafe {
-            *out_child = box_node(child);
-        }
-        true.to_glib()
-    } else {
-        unsafe {
-            *out_child = ptr::null_mut();
-        }
-        false.to_glib()
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn rsvg_node_children_iter_next_back(
-    iter: *mut Children,
-    out_child: *mut *mut RsvgNode,
-) -> glib_sys::gboolean {
-    assert!(!iter.is_null());
-
-    let iter = unsafe { &mut *iter };
-    if let Some(child) = iter.next_back() {
         unsafe {
             *out_child = box_node(child);
         }
@@ -978,12 +958,12 @@ mod tests {
         let c = children.next();
         assert!(c.is_some());
         let c = c.unwrap();
-        assert!(rc_node_ptr_eq(&c, &child));
+        assert!(Rc::ptr_eq(&c, &child));
 
         let c = children.next_back();
         assert!(c.is_some());
         let c = c.unwrap();
-        assert!(rc_node_ptr_eq(&c, &second_child));
+        assert!(Rc::ptr_eq(&c, &second_child));
 
         assert!(children.next().is_none());
         assert!(children.next_back().is_none());
@@ -1026,17 +1006,7 @@ mod tests {
 
         let result: bool = from_glib(rsvg_node_children_iter_next(iter, &mut c));
         assert_eq!(result, true);
-        assert!(rc_node_ptr_eq(unsafe { &*c }, &child));
+        assert!(Rc::ptr_eq(unsafe { &*c }, &child));
         rsvg_node_unref(c);
-
-        let result: bool = from_glib(rsvg_node_children_iter_next_back(iter, &mut c));
-        assert_eq!(result, true);
-        assert!(rc_node_ptr_eq(unsafe { &*c }, &second_child));
-        rsvg_node_unref(c);
-
-        let result: bool = from_glib(rsvg_node_children_iter_next(iter, &mut c));
-        assert_eq!(result, false);
-        let result: bool = from_glib(rsvg_node_children_iter_next_back(iter, &mut c));
-        assert_eq!(result, false);
     }
 }

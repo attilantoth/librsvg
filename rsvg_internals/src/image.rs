@@ -1,4 +1,5 @@
 use cairo;
+use cairo::{MatrixTrait, Pattern};
 use cairo_sys;
 use glib;
 use glib::translate::*;
@@ -9,8 +10,8 @@ use std::ptr;
 
 use aspect_ratio::AspectRatio;
 use attributes::Attribute;
-use draw::{add_clipping_rect, draw_surface};
-use drawing_ctx::{self, RsvgDrawingCtx};
+use bbox::BoundingBox;
+use drawing_ctx::DrawingCtx;
 use handle::RsvgHandle;
 use length::*;
 use node::*;
@@ -19,10 +20,10 @@ use property_bag::PropertyBag;
 
 pub struct NodeImage {
     aspect: Cell<AspectRatio>,
-    x: Cell<RsvgLength>,
-    y: Cell<RsvgLength>,
-    w: Cell<RsvgLength>,
-    h: Cell<RsvgLength>,
+    x: Cell<Length>,
+    y: Cell<Length>,
+    w: Cell<Length>,
+    h: Cell<Length>,
     surface: RefCell<Option<cairo::ImageSurface>>,
 }
 
@@ -30,10 +31,10 @@ impl NodeImage {
     pub fn new() -> NodeImage {
         NodeImage {
             aspect: Cell::new(AspectRatio::default()),
-            x: Cell::new(RsvgLength::default()),
-            y: Cell::new(RsvgLength::default()),
-            w: Cell::new(RsvgLength::default()),
-            h: Cell::new(RsvgLength::default()),
+            x: Cell::new(Length::default()),
+            y: Cell::new(Length::default()),
+            w: Cell::new(Length::default()),
+            h: Cell::new(Length::default()),
             surface: RefCell::new(None),
         }
     }
@@ -58,13 +59,13 @@ impl NodeTrait for NodeImage {
                     "width",
                     value,
                     LengthDir::Horizontal,
-                    RsvgLength::check_nonnegative,
+                    Length::check_nonnegative,
                 )?),
                 Attribute::Height => self.h.set(parse_and_validate(
                     "height",
                     value,
                     LengthDir::Vertical,
-                    RsvgLength::check_nonnegative,
+                    Length::check_nonnegative,
                 )?),
 
                 Attribute::PreserveAspectRatio => {
@@ -107,7 +108,7 @@ impl NodeTrait for NodeImage {
         &self,
         node: &RsvgNode,
         cascaded: &CascadedValues,
-        draw_ctx: *mut RsvgDrawingCtx,
+        draw_ctx: &mut DrawingCtx,
         clipping: bool,
     ) {
         let values = cascaded.get();
@@ -118,27 +119,69 @@ impl NodeTrait for NodeImage {
             let w = self.w.get().normalize(values, draw_ctx);
             let h = self.h.get().normalize(values, draw_ctx);
 
-            drawing_ctx::with_discrete_layer(draw_ctx, node, values, clipping, &mut |cr| {
-                cr.save();
-
+            draw_ctx.with_discrete_layer(node, values, clipping, &mut |dc| {
                 let aspect = self.aspect.get();
 
                 if !values.is_overflow() && aspect.is_slice() {
-                    add_clipping_rect(draw_ctx, x, y, w, h);
+                    dc.clip(x, y, w, h);
                 }
 
-                let (x, y, w, h) = aspect.compute(
-                    f64::from(surface.get_width()),
-                    f64::from(surface.get_height()),
-                    x,
-                    y,
-                    w,
-                    h,
-                );
+                // The bounding box for <image> is decided by the values of x, y, w, h and not by
+                // the final computed image bounds.
+                let bbox = BoundingBox::new(&dc.get_cairo_context().get_matrix()).with_rect(Some(
+                    cairo::Rectangle {
+                        x,
+                        y,
+                        width: w,
+                        height: h,
+                    },
+                ));
 
-                draw_surface(draw_ctx, values, surface, x, y, w, h, clipping);
+                let width = surface.get_width();
+                let height = surface.get_height();
+                if clipping || width == 0 || height == 0 {
+                    return;
+                }
+
+                let width = f64::from(width);
+                let height = f64::from(height);
+
+                let (x, y, w, h) = aspect.compute(width, height, x, y, w, h);
+
+                let cr = dc.get_cairo_context();
+
+                cr.save();
+
+                dc.set_affine_on_cr(&cr);
+                cr.scale(w / width, h / height);
+                let x = x * width / w;
+                let y = y * height / h;
+
+                cr.set_operator(cairo::Operator::from(values.comp_op));
+
+                // We need to set extend appropriately, so can't use cr.set_source_surface().
+                //
+                // If extend is left at its default value (None), then bilinear scaling uses
+                // transparency outside of the image producing incorrect results.
+                // For example, in svg1.1/filters-blend-01-b.svgthere's a completely
+                // opaque 100×1 image of a gradient scaled to 100×98 which ends up
+                // transparent almost everywhere without this fix (which it shouldn't).
+                let ptn = cairo::SurfacePattern::create(&surface);
+                let mut matrix = cairo::Matrix::identity();
+                matrix.translate(-x, -y);
+                ptn.set_matrix(matrix);
+                ptn.set_extend(cairo::Extend::Pad);
+                cr.set_source(&ptn);
+
+                // Clip is needed due to extend being set to pad.
+                cr.rectangle(x, y, width, height);
+                cr.clip();
+
+                cr.paint();
 
                 cr.restore();
+
+                dc.insert_bbox(&bbox);
             });
         }
     }

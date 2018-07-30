@@ -1,17 +1,12 @@
 use cssparser::{Parser, Token};
-use libc;
 use std::f64::consts::*;
 
-use drawing_ctx;
-use drawing_ctx::RsvgDrawingCtx;
+use drawing_ctx::DrawingCtx;
 use error::*;
 use parsers::Parse;
 use parsers::ParseError;
-use state::{ComputedValues, RsvgComputedValues};
-use util::utf8_cstr;
+use state::ComputedValues;
 
-// Keep this in sync with ../../rsvg-private.h:LengthUnit
-#[repr(C)]
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub enum LengthUnit {
     Default,
@@ -19,12 +14,8 @@ pub enum LengthUnit {
     FontEm,
     FontEx,
     Inch,
-    RelativeLarger,
-    RelativeSmaller,
 }
 
-// Keep this in sync with ../../rsvg-private.h:LengthDir
-#[repr(C)]
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub enum LengthDir {
     Horizontal,
@@ -32,22 +23,16 @@ pub enum LengthDir {
     Both,
 }
 
-// This is *not* an opaque struct; it is actually visible to the C code.  It is so
-// that the remaining C code can create RsvgLength values as part of existing
-// structures or objects, without allocations on the heap.
-//
-// Keep this in sync with ../../rsvg-private.h:RsvgLength
-#[repr(C)]
 #[derive(Debug, PartialEq, Copy, Clone)]
-pub struct RsvgLength {
+pub struct Length {
     pub length: f64,
     pub unit: LengthUnit,
     dir: LengthDir,
 }
 
-impl Default for RsvgLength {
-    fn default() -> RsvgLength {
-        RsvgLength {
+impl Default for Length {
+    fn default() -> Length {
+        Length {
             length: 0.0,
             unit: LengthUnit::Default,
             dir: LengthDir::Both,
@@ -60,47 +45,6 @@ const CM_PER_INCH: f64 = 2.54;
 const MM_PER_INCH: f64 = 25.4;
 const PICA_PER_INCH: f64 = 6.0;
 
-fn compute_named_size(name: &str) -> f64 {
-    let power: f64;
-
-    match name {
-        "xx-small" => {
-            power = -3.0;
-        }
-        "x-small" => {
-            power = -2.0;
-        }
-        "small" => {
-            power = -1.0;
-        }
-        "medium" => {
-            power = 0.0;
-        }
-        "large" => {
-            power = 1.0;
-        }
-        "x-large" => {
-            power = 2.0;
-        }
-        "xx-large" => {
-            power = 3.0;
-        }
-        _ => {
-            unreachable!();
-        }
-    }
-
-    12.0 * 1.2f64.powf(power) / POINTS_PER_INCH
-}
-
-#[no_mangle]
-pub extern "C" fn rsvg_length_parse(string: *const libc::c_char, dir: LengthDir) -> RsvgLength {
-    let my_string = unsafe { utf8_cstr(string) };
-
-    // FIXME: this ignores errors; propagate them upstream
-    RsvgLength::parse_str(my_string, dir).unwrap_or_else(|_| RsvgLength::default())
-}
-
 // https://www.w3.org/TR/SVG/types.html#DataTypeLength
 // https://www.w3.org/TR/2008/REC-CSS2-20080411/syndata.html#length-units
 // Lengths have units.  When they need to be need resolved to
@@ -108,7 +52,7 @@ pub extern "C" fn rsvg_length_parse(string: *const libc::c_char, dir: LengthDir)
 // need to know if they are horizontal/vertical/both.  For example,
 // a some_object.width="50%" is 50% with respect to the current
 // viewport's width.  In this case, the @dir argument is used
-// inside RsvgLength::normalize(), when it needs to know to what the
+// inside Length::normalize(), when it needs to know to what the
 // length refers.
 
 fn make_err() -> AttributeError {
@@ -118,12 +62,12 @@ fn make_err() -> AttributeError {
     ))
 }
 
-impl Parse for RsvgLength {
+impl Parse for Length {
     type Data = LengthDir;
     type Err = AttributeError;
 
-    fn parse(parser: &mut Parser, dir: LengthDir) -> Result<RsvgLength, AttributeError> {
-        let length = RsvgLength::from_cssparser(parser, dir)?;
+    fn parse(parser: &mut Parser, dir: LengthDir) -> Result<Length, AttributeError> {
+        let length = Length::from_cssparser(parser, dir)?;
 
         parser.expect_exhausted().map_err(|_| make_err())?;
 
@@ -131,16 +75,16 @@ impl Parse for RsvgLength {
     }
 }
 
-impl RsvgLength {
-    pub fn new(l: f64, unit: LengthUnit, dir: LengthDir) -> RsvgLength {
-        RsvgLength {
+impl Length {
+    pub fn new(l: f64, unit: LengthUnit, dir: LengthDir) -> Length {
+        Length {
             length: l,
             unit,
             dir,
         }
     }
 
-    pub fn check_nonnegative(self) -> Result<RsvgLength, AttributeError> {
+    pub fn check_nonnegative(self) -> Result<Length, AttributeError> {
         if self.length >= 0.0 {
             Ok(self)
         } else {
@@ -150,12 +94,12 @@ impl RsvgLength {
         }
     }
 
-    pub fn normalize(&self, values: &ComputedValues, draw_ctx: *const RsvgDrawingCtx) -> f64 {
+    pub fn normalize(&self, values: &ComputedValues, draw_ctx: &DrawingCtx) -> f64 {
         match self.unit {
             LengthUnit::Default => self.length,
 
             LengthUnit::Percent => {
-                let (width, height) = drawing_ctx::get_view_box_size(draw_ctx);
+                let (width, height) = draw_ctx.get_view_box_size();
 
                 match self.dir {
                     LengthDir::Horizontal => self.length * width,
@@ -169,10 +113,6 @@ impl RsvgLength {
             LengthUnit::FontEx => self.length * font_size_from_values(values, draw_ctx) / 2.0,
 
             LengthUnit::Inch => font_size_from_inch(self.length, self.dir, draw_ctx),
-
-            LengthUnit::RelativeLarger => font_size_from_values(values, draw_ctx) * 1.2,
-
-            LengthUnit::RelativeSmaller => font_size_from_values(values, draw_ctx) / 1.2,
         }
     }
 
@@ -191,23 +131,14 @@ impl RsvgLength {
     ) -> f64 {
         match self.unit {
             LengthUnit::Default => self.length,
-
             LengthUnit::Percent => self.length * width_or_height,
-
             LengthUnit::FontEm => self.length * font_size,
-
             LengthUnit::FontEx => self.length * font_size / 2.0,
-
             LengthUnit::Inch => self.length * pixels_per_inch,
-
-            _ => 0.0,
         }
     }
 
-    pub fn from_cssparser(
-        parser: &mut Parser,
-        dir: LengthDir,
-    ) -> Result<RsvgLength, AttributeError> {
+    pub fn from_cssparser(parser: &mut Parser, dir: LengthDir) -> Result<Length, AttributeError> {
         let length = {
             let token = parser.next().map_err(|_| {
                 AttributeError::Parse(ParseError::new(
@@ -216,13 +147,13 @@ impl RsvgLength {
             })?;
 
             match *token {
-                Token::Number { value, .. } => RsvgLength {
+                Token::Number { value, .. } => Length {
                     length: f64::from(value),
                     unit: LengthUnit::Default,
                     dir,
                 },
 
-                Token::Percentage { unit_value, .. } => RsvgLength {
+                Token::Percentage { unit_value, .. } => Length {
                     length: f64::from(unit_value),
                     unit: LengthUnit::Percent,
                     dir,
@@ -234,49 +165,49 @@ impl RsvgLength {
                     let value = f64::from(value);
 
                     match unit.as_ref() {
-                        "em" => RsvgLength {
+                        "em" => Length {
                             length: value,
                             unit: LengthUnit::FontEm,
                             dir,
                         },
 
-                        "ex" => RsvgLength {
+                        "ex" => Length {
                             length: value,
                             unit: LengthUnit::FontEx,
                             dir,
                         },
 
-                        "pt" => RsvgLength {
+                        "pt" => Length {
                             length: value / POINTS_PER_INCH,
                             unit: LengthUnit::Inch,
                             dir,
                         },
 
-                        "in" => RsvgLength {
+                        "in" => Length {
                             length: value,
                             unit: LengthUnit::Inch,
                             dir,
                         },
 
-                        "cm" => RsvgLength {
+                        "cm" => Length {
                             length: value / CM_PER_INCH,
                             unit: LengthUnit::Inch,
                             dir,
                         },
 
-                        "mm" => RsvgLength {
+                        "mm" => Length {
                             length: value / MM_PER_INCH,
                             unit: LengthUnit::Inch,
                             dir,
                         },
 
-                        "pc" => RsvgLength {
+                        "pc" => Length {
                             length: value / PICA_PER_INCH,
                             unit: LengthUnit::Inch,
                             dir,
                         },
 
-                        "px" => RsvgLength {
+                        "px" => Length {
                             length: value,
                             unit: LengthUnit::Default,
                             dir,
@@ -286,30 +217,6 @@ impl RsvgLength {
                     }
                 }
 
-                // FIXME: why are the following in Length?  They should be in FontSize
-                Token::Ident(ref cow) => match cow.as_ref() {
-                    "larger" => RsvgLength {
-                        length: 0.0,
-                        unit: LengthUnit::RelativeLarger,
-                        dir,
-                    },
-
-                    "smaller" => RsvgLength {
-                        length: 0.0,
-                        unit: LengthUnit::RelativeSmaller,
-                        dir,
-                    },
-
-                    "xx-small" | "x-small" | "small" | "medium" | "large" | "x-large"
-                    | "xx-large" => RsvgLength {
-                        length: compute_named_size(cow),
-                        unit: LengthUnit::Inch,
-                        dir,
-                    },
-
-                    _ => return Err(make_err()),
-                },
-
                 _ => return Err(make_err()),
             }
         };
@@ -318,8 +225,8 @@ impl RsvgLength {
     }
 }
 
-fn font_size_from_inch(length: f64, dir: LengthDir, draw_ctx: *const RsvgDrawingCtx) -> f64 {
-    let (dpi_x, dpi_y) = drawing_ctx::get_dpi(draw_ctx);
+fn font_size_from_inch(length: f64, dir: LengthDir, draw_ctx: &DrawingCtx) -> f64 {
+    let (dpi_x, dpi_y) = draw_ctx.get_dpi();
 
     match dir {
         LengthDir::Horizontal => length * dpi_x,
@@ -328,19 +235,15 @@ fn font_size_from_inch(length: f64, dir: LengthDir, draw_ctx: *const RsvgDrawing
     }
 }
 
-fn font_size_from_values(values: &ComputedValues, draw_ctx: *const RsvgDrawingCtx) -> f64 {
-    let v = &values.font_size.0;
+fn font_size_from_values(values: &ComputedValues, draw_ctx: &DrawingCtx) -> f64 {
+    let v = &values.font_size.0.value();
 
     match v.unit {
         LengthUnit::Default => v.length,
 
         LengthUnit::Inch => font_size_from_inch(v.length, v.dir, draw_ctx),
 
-        LengthUnit::Percent
-        | LengthUnit::FontEm
-        | LengthUnit::FontEx
-        | LengthUnit::RelativeLarger
-        | LengthUnit::RelativeSmaller => {
+        LengthUnit::Percent | LengthUnit::FontEm | LengthUnit::FontEx => {
             unreachable!("ComputedValues can't have a relative font size")
         }
     }
@@ -354,10 +257,115 @@ fn viewport_percentage(x: f64, y: f64) -> f64 {
     (x * x + y * y).sqrt() / SQRT_2
 }
 
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum FontSizeSpec {
+    Smaller,
+    Larger,
+    XXSmall,
+    XSmall,
+    Small,
+    Medium,
+    Large,
+    XLarge,
+    XXLarge,
+    Value(Length),
+}
+
+impl FontSizeSpec {
+    pub fn value(&self) -> Length {
+        match self {
+            FontSizeSpec::Value(s) => s.clone(),
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn compute(&self, v: &ComputedValues) -> Self {
+        let compute_points = |p| 12.0 * 1.2f64.powf(p) / POINTS_PER_INCH;
+
+        let size = v.font_size.0.value();
+
+        let new_size = match self {
+            FontSizeSpec::Smaller => Length::new(size.length / 1.2, size.unit, LengthDir::Both),
+            FontSizeSpec::Larger => Length::new(size.length * 1.2, size.unit, LengthDir::Both),
+            FontSizeSpec::XXSmall => {
+                Length::new(compute_points(-3.0), LengthUnit::Inch, LengthDir::Both)
+            }
+            FontSizeSpec::XSmall => {
+                Length::new(compute_points(-2.0), LengthUnit::Inch, LengthDir::Both)
+            }
+            FontSizeSpec::Small => {
+                Length::new(compute_points(-1.0), LengthUnit::Inch, LengthDir::Both)
+            }
+            FontSizeSpec::Medium => {
+                Length::new(compute_points(0.0), LengthUnit::Inch, LengthDir::Both)
+            }
+            FontSizeSpec::Large => {
+                Length::new(compute_points(1.0), LengthUnit::Inch, LengthDir::Both)
+            }
+            FontSizeSpec::XLarge => {
+                Length::new(compute_points(2.0), LengthUnit::Inch, LengthDir::Both)
+            }
+            FontSizeSpec::XXLarge => {
+                Length::new(compute_points(3.0), LengthUnit::Inch, LengthDir::Both)
+            }
+            FontSizeSpec::Value(s) if s.unit == LengthUnit::Percent => {
+                Length::new(size.length * s.length, size.unit, LengthDir::Both)
+            }
+            FontSizeSpec::Value(s) => s.clone(),
+        };
+
+        FontSizeSpec::Value(new_size)
+    }
+
+    pub fn normalize(&self, values: &ComputedValues, draw_ctx: &DrawingCtx) -> f64 {
+        self.value().normalize(values, draw_ctx)
+    }
+}
+
+impl Parse for FontSizeSpec {
+    type Data = ();
+    type Err = AttributeError;
+
+    fn parse(parser: &mut Parser, _: Self::Data) -> Result<FontSizeSpec, ::error::AttributeError> {
+        let parser_state = parser.state();
+
+        Length::parse(parser, LengthDir::Both)
+            .and_then(|s| Ok(FontSizeSpec::Value(s)))
+            .or_else(|e| {
+                parser.reset(&parser_state);
+
+                {
+                    let token = parser.next().map_err(|_| {
+                        ::error::AttributeError::Parse(::parsers::ParseError::new("expected token"))
+                    })?;
+
+                    if let Token::Ident(ref cow) = token {
+                        match cow.as_ref() {
+                            "smaller" => return Ok(FontSizeSpec::Smaller),
+                            "larger" => return Ok(FontSizeSpec::Larger),
+                            "xx-small" => return Ok(FontSizeSpec::XXSmall),
+                            "x-small" => return Ok(FontSizeSpec::XSmall),
+                            "small" => return Ok(FontSizeSpec::Small),
+                            "medium" => return Ok(FontSizeSpec::Medium),
+                            "large" => return Ok(FontSizeSpec::Large),
+                            "x-large" => return Ok(FontSizeSpec::XLarge),
+                            "xx-large" => return Ok(FontSizeSpec::XXLarge),
+                            _ => (),
+                        };
+                    }
+                }
+
+                parser.reset(&parser_state);
+
+                Err(e)
+            })
+    }
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum Dasharray {
     None,
-    Array(Vec<RsvgLength>),
+    Array(Vec<Length>),
 }
 
 impl Default for Dasharray {
@@ -380,13 +388,12 @@ impl Parse for Dasharray {
 }
 
 // This does not handle "inherit" or "none" state, the caller is responsible for that.
-fn parse_dash_array(parser: &mut Parser) -> Result<Vec<RsvgLength>, AttributeError> {
+fn parse_dash_array(parser: &mut Parser) -> Result<Vec<Length>, AttributeError> {
     let mut dasharray = Vec::new();
 
     loop {
         dasharray.push(
-            RsvgLength::from_cssparser(parser, LengthDir::Both)
-                .and_then(RsvgLength::check_nonnegative)?,
+            Length::from_cssparser(parser, LengthDir::Both).and_then(Length::check_nonnegative)?,
         );
 
         if parser.is_exhausted() {
@@ -399,35 +406,6 @@ fn parse_dash_array(parser: &mut Parser) -> Result<Vec<RsvgLength>, AttributeErr
     Ok(dasharray)
 }
 
-#[no_mangle]
-pub extern "C" fn rsvg_length_normalize(
-    raw_length: *const RsvgLength,
-    values: RsvgComputedValues,
-    draw_ctx: *const RsvgDrawingCtx,
-) -> f64 {
-    assert!(!raw_length.is_null());
-    let length: &RsvgLength = unsafe { &*raw_length };
-
-    assert!(!values.is_null());
-    let values = unsafe { &*values };
-
-    length.normalize(values, draw_ctx)
-}
-
-#[no_mangle]
-pub extern "C" fn rsvg_length_hand_normalize(
-    raw_length: *const RsvgLength,
-    pixels_per_inch: f64,
-    width_or_height: f64,
-    font_size: f64,
-) -> f64 {
-    assert!(!raw_length.is_null());
-
-    let length: &RsvgLength = unsafe { &*raw_length };
-
-    length.hand_normalize(pixels_per_inch, width_or_height, font_size)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,8 +413,8 @@ mod tests {
     #[test]
     fn parses_default() {
         assert_eq!(
-            RsvgLength::parse_str("42", LengthDir::Horizontal),
-            Ok(RsvgLength::new(
+            Length::parse_str("42", LengthDir::Horizontal),
+            Ok(Length::new(
                 42.0,
                 LengthUnit::Default,
                 LengthDir::Horizontal
@@ -444,8 +422,8 @@ mod tests {
         );
 
         assert_eq!(
-            RsvgLength::parse_str("-42px", LengthDir::Horizontal),
-            Ok(RsvgLength::new(
+            Length::parse_str("-42px", LengthDir::Horizontal),
+            Ok(Length::new(
                 -42.0,
                 LengthUnit::Default,
                 LengthDir::Horizontal
@@ -456,136 +434,64 @@ mod tests {
     #[test]
     fn parses_percent() {
         assert_eq!(
-            RsvgLength::parse_str("50.0%", LengthDir::Horizontal),
-            Ok(RsvgLength::new(
-                0.5,
-                LengthUnit::Percent,
-                LengthDir::Horizontal
-            ))
+            Length::parse_str("50.0%", LengthDir::Horizontal),
+            Ok(Length::new(0.5, LengthUnit::Percent, LengthDir::Horizontal))
         );
     }
 
     #[test]
     fn parses_font_em() {
         assert_eq!(
-            RsvgLength::parse_str("22.5em", LengthDir::Vertical),
-            Ok(RsvgLength::new(
-                22.5,
-                LengthUnit::FontEm,
-                LengthDir::Vertical
-            ))
+            Length::parse_str("22.5em", LengthDir::Vertical),
+            Ok(Length::new(22.5, LengthUnit::FontEm, LengthDir::Vertical))
         );
     }
 
     #[test]
     fn parses_font_ex() {
         assert_eq!(
-            RsvgLength::parse_str("22.5ex", LengthDir::Vertical),
-            Ok(RsvgLength::new(
-                22.5,
-                LengthUnit::FontEx,
-                LengthDir::Vertical
-            ))
+            Length::parse_str("22.5ex", LengthDir::Vertical),
+            Ok(Length::new(22.5, LengthUnit::FontEx, LengthDir::Vertical))
         );
     }
 
     #[test]
     fn parses_physical_units() {
         assert_eq!(
-            RsvgLength::parse_str("72pt", LengthDir::Both),
-            Ok(RsvgLength::new(1.0, LengthUnit::Inch, LengthDir::Both))
+            Length::parse_str("72pt", LengthDir::Both),
+            Ok(Length::new(1.0, LengthUnit::Inch, LengthDir::Both))
         );
 
         assert_eq!(
-            RsvgLength::parse_str("-22.5in", LengthDir::Both),
-            Ok(RsvgLength::new(-22.5, LengthUnit::Inch, LengthDir::Both))
+            Length::parse_str("-22.5in", LengthDir::Both),
+            Ok(Length::new(-22.5, LengthUnit::Inch, LengthDir::Both))
         );
 
         assert_eq!(
-            RsvgLength::parse_str("-254cm", LengthDir::Both),
-            Ok(RsvgLength::new(-100.0, LengthUnit::Inch, LengthDir::Both))
+            Length::parse_str("-254cm", LengthDir::Both),
+            Ok(Length::new(-100.0, LengthUnit::Inch, LengthDir::Both))
         );
 
         assert_eq!(
-            RsvgLength::parse_str("254mm", LengthDir::Both),
-            Ok(RsvgLength::new(10.0, LengthUnit::Inch, LengthDir::Both))
+            Length::parse_str("254mm", LengthDir::Both),
+            Ok(Length::new(10.0, LengthUnit::Inch, LengthDir::Both))
         );
 
         assert_eq!(
-            RsvgLength::parse_str("60pc", LengthDir::Both),
-            Ok(RsvgLength::new(10.0, LengthUnit::Inch, LengthDir::Both))
+            Length::parse_str("60pc", LengthDir::Both),
+            Ok(Length::new(10.0, LengthUnit::Inch, LengthDir::Both))
         );
-    }
-
-    #[test]
-    fn parses_relative_larger() {
-        assert_eq!(
-            RsvgLength::parse_str("larger", LengthDir::Vertical),
-            Ok(RsvgLength::new(
-                0.0,
-                LengthUnit::RelativeLarger,
-                LengthDir::Vertical
-            ))
-        );
-    }
-
-    #[test]
-    fn parses_relative_smaller() {
-        assert_eq!(
-            RsvgLength::parse_str("smaller", LengthDir::Vertical),
-            Ok(RsvgLength::new(
-                0.0,
-                LengthUnit::RelativeSmaller,
-                LengthDir::Vertical
-            ))
-        );
-    }
-
-    #[test]
-    fn parses_named_sizes() {
-        let names = vec![
-            "xx-small", "x-small", "small", "medium", "large", "x-large", "xx-large",
-        ];
-
-        let mut previous_value: Option<f64> = None;
-
-        // Just ensure that the values are progressively larger; don't
-        // enforce a particular sequence.
-
-        for name in names {
-            let length = RsvgLength::parse_str(name, LengthDir::Both).unwrap();
-
-            assert_eq!(length.unit, LengthUnit::Inch);
-            assert_eq!(length.dir, LengthDir::Both);
-
-            if let Some(v) = previous_value {
-                assert!(length.length > v);
-            } else {
-                previous_value = Some(length.length);
-            }
-        }
     }
 
     #[test]
     fn empty_length_yields_error() {
-        assert!(is_parse_error(&RsvgLength::parse_str("", LengthDir::Both)));
+        assert!(is_parse_error(&Length::parse_str("", LengthDir::Both)));
     }
 
     #[test]
     fn invalid_unit_yields_error() {
-        assert!(is_parse_error(&RsvgLength::parse_str(
+        assert!(is_parse_error(&Length::parse_str(
             "8furlong",
-            LengthDir::Both
-        )));
-    }
-
-    #[test]
-    fn invalid_font_size_yields_error() {
-        // FIXME: this is intended to test the (absence of) the "larger" et al values.
-        // Since they really be in FontSize, not RsvgLength, we should remember
-        // to move this test to that type later.
-        assert!(is_parse_error(&RsvgLength::parse_str(
-            "furlong",
             LengthDir::Both
         )));
     }
@@ -593,15 +499,20 @@ mod tests {
     #[test]
     fn check_nonnegative_works() {
         assert!(
-            RsvgLength::parse_str("0", LengthDir::Both)
+            Length::parse_str("0", LengthDir::Both)
                 .and_then(|l| l.check_nonnegative())
                 .is_ok()
         );
         assert!(
-            RsvgLength::parse_str("-10", LengthDir::Both)
+            Length::parse_str("-10", LengthDir::Both)
                 .and_then(|l| l.check_nonnegative())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn invalid_font_size_yields_error() {
+        assert!(is_parse_error(&FontSizeSpec::parse_str("furlong", ())));
     }
 
     fn parse_dash_array_str(s: &str) -> Result<Dasharray, AttributeError> {
@@ -611,7 +522,7 @@ mod tests {
     #[test]
     fn parses_dash_array() {
         // helper to cut down boilderplate
-        let length_parse = |s| RsvgLength::parse_str(s, LengthDir::Both).unwrap();
+        let length_parse = |s| Length::parse_str(s, LengthDir::Both).unwrap();
 
         let expected = Dasharray::Array(vec![
             length_parse("1"),

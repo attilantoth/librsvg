@@ -2,8 +2,7 @@ use cairo;
 use cairo::MatrixTrait;
 
 use aspect_ratio::AspectRatio;
-use draw::add_clipping_rect;
-use drawing_ctx::{self, RsvgDrawingCtx};
+use drawing_ctx::DrawingCtx;
 use float_eq_cairo::ApproxEqCairo;
 use node::RsvgNode;
 use state::ComputedValues;
@@ -27,9 +26,9 @@ pub fn draw_in_viewport(
     node: &RsvgNode,
     values: &ComputedValues,
     mut affine: cairo::Matrix,
-    draw_ctx: *mut RsvgDrawingCtx,
+    draw_ctx: &mut DrawingCtx,
     clipping: bool,
-    draw_fn: &mut FnMut(&cairo::Context),
+    draw_fn: &mut FnMut(&mut DrawingCtx),
 ) {
     // width or height set to 0 disables rendering of the element
     // https://www.w3.org/TR/SVG/struct.html#SVGElementWidthAttribute
@@ -41,10 +40,10 @@ pub fn draw_in_viewport(
         return;
     }
 
-    drawing_ctx::with_discrete_layer(draw_ctx, node, values, clipping, &mut |cr| {
+    draw_ctx.with_discrete_layer(node, values, clipping, &mut |dc| {
         if do_clip && clip_mode == ClipMode::ClipToViewport {
-            drawing_ctx::get_cairo_context(draw_ctx).set_matrix(affine);
-            add_clipping_rect(draw_ctx, vx, vy, vw, vh);
+            dc.get_cairo_context().set_matrix(affine);
+            dc.clip(vx, vy, vw, vh);
         }
 
         if let Some(vbox) = vbox {
@@ -57,7 +56,7 @@ pub fn draw_in_viewport(
                 return;
             }
 
-            drawing_ctx::push_view_box(draw_ctx, vbox.0.width, vbox.0.height);
+            dc.push_view_box(vbox.0.width, vbox.0.height);
 
             let (x, y, w, h) =
                 preserve_aspect_ratio.compute(vbox.0.width, vbox.0.height, vx, vy, vw, vh);
@@ -66,20 +65,19 @@ pub fn draw_in_viewport(
             affine.scale(w / vbox.0.width, h / vbox.0.height);
             affine.translate(-vbox.0.x, -vbox.0.y);
 
-            drawing_ctx::get_cairo_context(draw_ctx).set_matrix(affine);
+            dc.get_cairo_context().set_matrix(affine);
 
             if do_clip && clip_mode == ClipMode::ClipToVbox {
-                add_clipping_rect(draw_ctx, vbox.0.x, vbox.0.y, vbox.0.width, vbox.0.height);
+                dc.clip(vbox.0.x, vbox.0.y, vbox.0.width, vbox.0.height);
             }
         } else {
-            drawing_ctx::push_view_box(draw_ctx, vw, vh);
-
+            dc.push_view_box(vw, vh);
             affine.translate(vx, vy);
-            drawing_ctx::get_cairo_context(draw_ctx).set_matrix(affine);
+            dc.get_cairo_context().set_matrix(affine);
         }
 
-        draw_fn(cr);
+        draw_fn(dc);
 
-        drawing_ctx::pop_view_box(draw_ctx);
+        dc.pop_view_box();
     });
 }

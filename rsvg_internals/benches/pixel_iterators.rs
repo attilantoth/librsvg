@@ -1,27 +1,27 @@
-#![feature(test)]
+#[macro_use]
+extern crate criterion;
+use criterion::Criterion;
 
 extern crate cairo;
 extern crate cairo_sys;
 extern crate rsvg_internals;
-extern crate test;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rsvg_internals::filters::context::IRect;
-    use rsvg_internals::filters::iterators;
-    use test::Bencher;
+use rsvg_internals::filters::context::IRect;
+use rsvg_internals::surface_utils::{
+    iterators::Pixels,
+    shared_surface::{SharedImageSurface, SurfaceType},
+};
 
-    const SURFACE_SIDE: i32 = 512;
-    const BOUNDS: IRect = IRect {
-        x0: 64,
-        y0: 32,
-        x1: 448,
-        y1: 480,
-    };
+const SURFACE_SIDE: i32 = 512;
+const BOUNDS: IRect = IRect {
+    x0: 64,
+    y0: 32,
+    x1: 448,
+    y1: 480,
+};
 
-    #[bench]
-    fn bench_straightforward(b: &mut Bencher) {
+fn bench_pixel_iterators(c: &mut Criterion) {
+    c.bench_function("pixel_iterators straightforward", |b| {
         let mut surface =
             cairo::ImageSurface::create(cairo::Format::ARgb32, SURFACE_SIDE, SURFACE_SIDE).unwrap();
         let stride = surface.get_stride();
@@ -46,13 +46,12 @@ mod tests {
 
             (r, g, b, a)
         })
-    }
+    });
 
-    #[bench]
-    fn bench_straightforward_getpixel(b: &mut Bencher) {
+    c.bench_function("pixel_iterators get_pixel", |b| {
         let surface =
             cairo::ImageSurface::create(cairo::Format::ARgb32, SURFACE_SIDE, SURFACE_SIDE).unwrap();
-        let data = iterators::ImageSurfaceDataShared::new(&surface).unwrap();
+        let surface = SharedImageSurface::new(surface, SurfaceType::SRgb).unwrap();
 
         b.iter(|| {
             let mut r = 0usize;
@@ -62,7 +61,7 @@ mod tests {
 
             for y in BOUNDS.y0..BOUNDS.y1 {
                 for x in BOUNDS.x0..BOUNDS.x1 {
-                    let pixel = data.get_pixel(x as usize, y as usize);
+                    let pixel = surface.get_pixel(x as u32, y as u32);
 
                     r += pixel.r as usize;
                     g += pixel.g as usize;
@@ -73,13 +72,12 @@ mod tests {
 
             (r, g, b, a)
         })
-    }
+    });
 
-    #[bench]
-    fn bench_pixels(b: &mut Bencher) {
+    c.bench_function("pixel_iterators pixels", |b| {
         let surface =
             cairo::ImageSurface::create(cairo::Format::ARgb32, SURFACE_SIDE, SURFACE_SIDE).unwrap();
-        let data = iterators::ImageSurfaceDataShared::new(&surface).unwrap();
+        let data = SharedImageSurface::new(surface, SurfaceType::SRgb).unwrap();
 
         b.iter(|| {
             let mut r = 0usize;
@@ -87,7 +85,7 @@ mod tests {
             let mut b = 0usize;
             let mut a = 0usize;
 
-            for (_x, _y, pixel) in iterators::Pixels::new(data, BOUNDS) {
+            for (_x, _y, pixel) in Pixels::new(&data, BOUNDS) {
                 r += pixel.r as usize;
                 g += pixel.g as usize;
                 b += pixel.b as usize;
@@ -96,5 +94,8 @@ mod tests {
 
             (r, g, b, a)
         })
-    }
+    });
 }
+
+criterion_group!(benches, bench_pixel_iterators);
+criterion_main!(benches);

@@ -4,7 +4,7 @@ use cairo::{self, MatrixTrait};
 
 use attributes::Attribute;
 use coord_units::CoordUnits;
-use drawing_ctx::{self, RsvgDrawingCtx};
+use drawing_ctx::DrawingCtx;
 use handle::RsvgHandle;
 use node::{NodeResult, NodeTrait, RsvgNode};
 use parsers::parse;
@@ -31,15 +31,21 @@ impl NodeClipPath {
         &self,
         node: &RsvgNode,
         affine_before_clip: &cairo::Matrix,
-        draw_ctx: *mut RsvgDrawingCtx,
+        draw_ctx: &mut DrawingCtx,
     ) {
         let cascaded = node.get_cascaded_values();
 
         let clip_units = self.units.get();
 
-        let orig_bbox = drawing_ctx::get_bbox(draw_ctx).clone();
+        let orig_bbox = draw_ctx.get_bbox().clone();
 
         let child_matrix = if clip_units == ClipPathUnits(CoordUnits::ObjectBoundingBox) {
+            if orig_bbox.rect.is_none() {
+                // The node being clipped is empty / doesn't have a
+                // bounding box, so there's nothing to clip!
+                return;
+            }
+
             let rect = orig_bbox.rect.unwrap();
 
             let mut bbtransform =
@@ -49,7 +55,7 @@ impl NodeClipPath {
             *affine_before_clip
         };
 
-        let cr = drawing_ctx::get_cairo_context(draw_ctx);
+        let cr = draw_ctx.get_cairo_context();
         let save_affine = cr.get_matrix();
         cr.set_matrix(child_matrix);
 
@@ -62,9 +68,9 @@ impl NodeClipPath {
         // accumulating bounding boxes.  We'll remove this later, when we
         // are able to extract bounding boxes from outside the
         // general drawing loop.
-        drawing_ctx::set_bbox(draw_ctx, &orig_bbox);
+        draw_ctx.set_bbox(&orig_bbox);
 
-        let cr = drawing_ctx::get_cairo_context(draw_ctx);
+        let cr = draw_ctx.get_cairo_context();
         cr.clip();
     }
 }
