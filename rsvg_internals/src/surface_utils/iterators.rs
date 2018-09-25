@@ -12,6 +12,7 @@ pub struct Pixels<'a> {
     bounds: IRect,
     x: u32,
     y: u32,
+    offset: isize,
 }
 
 /// Iterator over a (potentially out of bounds) rectangle of pixels of a `SharedImageSurface`.
@@ -44,6 +45,7 @@ impl<'a> Pixels<'a> {
             bounds,
             x: bounds.x0 as u32,
             y: bounds.y0 as u32,
+            offset: bounds.y0 as isize * surface.stride() as isize + bounds.x0 as isize * 4,
         }
     }
 }
@@ -66,6 +68,12 @@ impl<'a> PixelRectangle<'a> {
         assert!(bounds.y0 <= surface.height());
         assert!(bounds.y1 >= bounds.y0);
         assert!(bounds.y1 <= surface.height());
+
+        // Non-None EdgeMode values need at least one pixel available.
+        if edge_mode != EdgeMode::None {
+            assert!(bounds.x1 > bounds.x0);
+            assert!(bounds.y1 > bounds.y0);
+        }
 
         assert!(rectangle.x1 >= rectangle.x0);
         assert!(rectangle.y1 >= rectangle.y0);
@@ -91,13 +99,20 @@ impl<'a> Iterator for Pixels<'a> {
             return None;
         }
 
-        let rv = Some((self.x, self.y, self.surface.get_pixel(self.x, self.y)));
+        let rv = Some((
+            self.x,
+            self.y,
+            self.surface.get_pixel_by_offset(self.offset),
+        ));
 
         if self.x + 1 == self.bounds.x1 as u32 {
             self.x = self.bounds.x0 as u32;
             self.y += 1;
+            self.offset +=
+                self.surface.stride() - (self.bounds.x1 - self.bounds.x0 - 1) as isize * 4;
         } else {
             self.x += 1;
+            self.offset += 4;
         }
 
         rv
@@ -129,8 +144,8 @@ impl<'a> Iterator for PixelRectangle<'a> {
                             a: 0,
                         },
                         EdgeMode::Duplicate => {
-                            let x = clamp(x, self.bounds.x0, self.bounds.x1);
-                            let y = clamp(y, self.bounds.y0, self.bounds.y1);
+                            let x = clamp(x, self.bounds.x0, self.bounds.x1 - 1);
+                            let y = clamp(y, self.bounds.y0, self.bounds.y1 - 1);
                             self.surface.get_pixel(x as u32, y as u32)
                         }
                         EdgeMode::Wrap => {

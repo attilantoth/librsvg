@@ -60,7 +60,7 @@ impl NodeTrait for ConvolveMatrix {
         &self,
         node: &RsvgNode,
         handle: *const RsvgHandle,
-        pbag: &PropertyBag,
+        pbag: &PropertyBag<'_>,
     ) -> NodeResult {
         self.base.set_atts(node, handle, pbag)?;
 
@@ -68,7 +68,7 @@ impl NodeTrait for ConvolveMatrix {
             match attr {
                 Attribute::Order => self.order.set(
                     parsers::integer_optional_integer(value)
-                        .map_err(|err| NodeError::parse_error(attr, err))
+                        .map_err(|err| NodeError::attribute_error(attr, err))
                         .and_then(|(x, y)| {
                             if x > 0 && y > 0 {
                                 Ok((x as u32, y as u32))
@@ -82,7 +82,7 @@ impl NodeTrait for ConvolveMatrix {
                 ),
                 Attribute::Divisor => self.divisor.set(Some(
                     parsers::number(value)
-                        .map_err(|err| NodeError::parse_error(attr, err))
+                        .map_err(|err| NodeError::attribute_error(attr, err))
                         .and_then(|x| {
                             if x != 0.0 {
                                 Ok(x)
@@ -91,13 +91,13 @@ impl NodeTrait for ConvolveMatrix {
                             }
                         })?,
                 )),
-                Attribute::Bias => self
-                    .bias
-                    .set(parsers::number(value).map_err(|err| NodeError::parse_error(attr, err))?),
+                Attribute::Bias => self.bias.set(
+                    parsers::number(value).map_err(|err| NodeError::attribute_error(attr, err))?,
+                ),
                 Attribute::EdgeMode => self.edge_mode.set(EdgeMode::parse(attr, value)?),
                 Attribute::KernelUnitLength => self.kernel_unit_length.set(Some(
                     parsers::number_optional_number(value)
-                        .map_err(|err| NodeError::parse_error(attr, err))
+                        .map_err(|err| NodeError::attribute_error(attr, err))
                         .and_then(|(x, y)| {
                             if x > 0.0 && y > 0.0 {
                                 Ok((x, y))
@@ -128,7 +128,7 @@ impl NodeTrait for ConvolveMatrix {
             match attr {
                 Attribute::TargetX => self.target_x.set(Some(
                     parsers::integer(value)
-                        .map_err(|err| NodeError::parse_error(attr, err))
+                        .map_err(|err| NodeError::attribute_error(attr, err))
                         .and_then(|x| {
                             if x >= 0 && x < self.order.get().0 as i32 {
                                 Ok(x as u32)
@@ -142,7 +142,7 @@ impl NodeTrait for ConvolveMatrix {
                 )),
                 Attribute::TargetY => self.target_y.set(Some(
                     parsers::integer(value)
-                        .map_err(|err| NodeError::parse_error(attr, err))
+                        .map_err(|err| NodeError::attribute_error(attr, err))
                         .and_then(|x| {
                             if x >= 0 && x < self.order.get().1 as i32 {
                                 Ok(x as u32)
@@ -196,6 +196,14 @@ impl NodeTrait for ConvolveMatrix {
             }));
         }
 
+        // kernel_matrix must have been specified.
+        if self.kernel_matrix.borrow().is_none() {
+            return Err(NodeError::value_error(
+                Attribute::KernelMatrix,
+                "the value must be set",
+            ));
+        }
+
         // Default value for the divisor.
         if self.divisor.get().is_none() {
             self.divisor.set(Some(
@@ -216,7 +224,7 @@ impl Filter for ConvolveMatrix {
         &self,
         _node: &RsvgNode,
         ctx: &FilterContext,
-        draw_ctx: &mut DrawingCtx,
+        draw_ctx: &mut DrawingCtx<'_>,
     ) -> Result<FilterResult, FilterError> {
         let input = self.base.get_input(ctx, draw_ctx)?;
         let mut bounds = self
@@ -308,14 +316,14 @@ impl Filter for ConvolveMatrix {
                         clamp(x, 0.0, clamped_a)
                     };
 
-                    (x * 255.0).round() as u8
+                    ((x * 255.0) + 0.5) as u8
                 };
 
                 let output_pixel = Pixel {
                     r: compute(r),
                     g: compute(g),
                     b: compute(b),
-                    a: (clamped_a * 255.0).round() as u8,
+                    a: ((clamped_a * 255.0) + 0.5) as u8,
                 };
 
                 output_data.set_pixel(output_stride, output_pixel, x, y);

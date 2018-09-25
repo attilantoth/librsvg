@@ -3,32 +3,18 @@ use downcast_rs::*;
 use glib;
 use glib::translate::*;
 use glib_sys;
-use libc;
-
 use std::cell::{Cell, Ref, RefCell};
 use std::ptr;
 use std::rc::{Rc, Weak};
-use std::str::FromStr;
 
 use attributes::Attribute;
 use cond::{RequiredExtensions, RequiredFeatures, SystemLanguage};
-use defs::{self, RsvgDefs};
 use drawing_ctx::DrawingCtx;
 use error::*;
-use handle::RsvgHandle;
-use parsers::{Parse, ParseError};
+use handle::{self, RsvgHandle};
+use parsers::Parse;
 use property_bag::PropertyBag;
-use state::{
-    self,
-    rsvg_state_new,
-    ComputedValues,
-    Overflow,
-    RsvgState,
-    SpecifiedValue,
-    SpecifiedValues,
-    State,
-};
-use util::utf8_cstr;
+use state::{ComputedValues, Overflow, SpecifiedValue, State};
 
 // A *const RsvgNode is just a pointer for the C code's benefit: it
 // points to an  Rc<Node>, which is our refcounted Rust representation
@@ -75,7 +61,7 @@ impl<'a> CascadedValues<'a> {
     /// This is to be used only in the toplevel drawing function, or in elements like `<marker>`
     /// that don't propagate their parent's cascade to their children.  All others should use
     /// `new()` to derive the cascade from an existing one.
-    fn new_from_node(node: &Node) -> CascadedValues {
+    fn new_from_node(node: &Node) -> CascadedValues<'_> {
         CascadedValues {
             inner: CascadedInner::FromNode(node.values.borrow()),
         }
@@ -87,8 +73,9 @@ impl<'a> CascadedValues<'a> {
     /// This is for the `<use>` element, which draws the element which it references with the
     /// `<use>`'s own cascade, not wih the element's original cascade.
     pub fn new_from_values(node: &'a Node, values: &ComputedValues) -> CascadedValues<'a> {
+        let state = node.state.borrow();
         let mut v = values.clone();
-        node.get_specified_values().to_computed_values(&mut v);
+        state.get_specified_values().to_computed_values(&mut v);
 
         CascadedValues {
             inner: CascadedInner::FromValues(v),
@@ -116,7 +103,7 @@ pub trait NodeTrait: Downcast {
         &self,
         node: &RsvgNode,
         handle: *const RsvgHandle,
-        pbag: &PropertyBag,
+        pbag: &PropertyBag<'_>,
     ) -> NodeResult;
 
     /// Sets any special-cased properties that the node may have, that are different
@@ -130,11 +117,12 @@ pub trait NodeTrait: Downcast {
     fn draw(
         &self,
         _node: &RsvgNode,
-        _cascaded: &CascadedValues,
-        _draw_ctx: &mut DrawingCtx,
+        _cascaded: &CascadedValues<'_>,
+        _draw_ctx: &mut DrawingCtx<'_>,
         _clipping: bool,
-    ) {
+    ) -> Result<(), RenderingError> {
         // by default nodes don't draw themselves
+        Ok(())
     }
 }
 
@@ -165,13 +153,14 @@ pub type NodeResult = Result<(), NodeError>;
 pub struct Node {
     node_type: NodeType,
     parent: Option<Weak<Node>>, // optional; weak ref to parent
+    element_name: String,       // we may want to intern these someday
     id: Option<String>,         // id attribute from XML element
     class: Option<String>,      // class attribute from XML element
     first_child: RefCell<Option<Rc<Node>>>,
     last_child: RefCell<Option<Weak<Node>>>,
     next_sib: RefCell<Option<Rc<Node>>>, // next sibling; strong ref
     prev_sib: RefCell<Option<Weak<Node>>>, // previous sibling; weak ref
-    state: *mut RsvgState,
+    state: RefCell<State>,
     result: RefCell<NodeResult>,
     transform: Cell<Matrix>,
     values: RefCell<ComputedValues>,
@@ -186,8 +175,6 @@ pub struct Children {
     next_back: Option<Rc<Node>>,
 }
 
-// Keep this in sync with rsvg-private.h:RsvgNodeType
-#[repr(C)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub enum NodeType {
     Invalid = 0,
@@ -248,21 +235,22 @@ impl Node {
     pub fn new(
         node_type: NodeType,
         parent: Option<Weak<Node>>,
+        element_name: &str,
         id: Option<&str>,
         class: Option<&str>,
-        state: *mut RsvgState,
         node_impl: Box<NodeTrait>,
     ) -> Node {
         Node {
             node_type,
             parent,
+            element_name: element_name.to_string(),
             id: id.map(str::to_string),
             class: class.map(str::to_string),
             first_child: RefCell::new(None),
             last_child: RefCell::new(None),
             next_sib: RefCell::new(None),
             prev_sib: RefCell::new(None),
-            state,
+            state: RefCell::new(State::new()),
             transform: Cell::new(Matrix::identity()),
             result: RefCell::new(Ok(())),
             values: RefCell::new(ComputedValues::default()),
@@ -283,31 +271,26 @@ impl Node {
         self.class.as_ref().map(String::as_str)
     }
 
-    pub fn register(&self, node: &RsvgNode, defs: *mut RsvgDefs) {
-        if let Some(ref id) = self.id {
-            defs::register_node_by_id(defs, id, node);
-        }
+    pub fn get_human_readable_name(&self) -> String {
+        format!(
+            "{:?} id={}",
+            self.node_type,
+            self.get_id().unwrap_or("None")
+        )
     }
 
     pub fn get_transform(&self) -> Matrix {
         self.transform.get()
     }
 
-    pub fn get_state_mut(&self) -> &mut State {
-        state::from_c_mut(self.state)
-    }
-
-    pub fn get_specified_values(&self) -> &SpecifiedValues {
-        state::from_c(self.state).get_specified_values()
-    }
-
-    pub fn get_cascaded_values(&self) -> CascadedValues {
+    pub fn get_cascaded_values(&self) -> CascadedValues<'_> {
         CascadedValues::new_from_node(self)
     }
 
     pub fn cascade(&self, values: &ComputedValues) {
+        let state = self.state.borrow();
         let mut values = values.clone();
-        self.get_specified_values().to_computed_values(&mut values);
+        state.get_specified_values().to_computed_values(&mut values);
         *self.values.borrow_mut() = values.clone();
 
         for child in self.children() {
@@ -354,7 +337,7 @@ impl Node {
         self.first_child.replace(Some(child.clone()));
     }
 
-    pub fn set_atts(&self, node: &RsvgNode, handle: *const RsvgHandle, pbag: &PropertyBag) {
+    pub fn set_atts(&self, node: &RsvgNode, handle: *const RsvgHandle, pbag: &PropertyBag<'_>) {
         for (_key, attr, value) in pbag.iter() {
             match attr {
                 Attribute::Transform => match Matrix::parse_str(value, ()) {
@@ -377,10 +360,19 @@ impl Node {
             }
         }
 
-        *self.result.borrow_mut() = self.node_impl.set_atts(node, handle, pbag);
+        match self.node_impl.set_atts(node, handle, pbag) {
+            Ok(_) => (),
+            Err(e) => {
+                self.set_error(e);
+                return;
+            }
+        }
     }
 
-    fn parse_conditional_processing_attributes(&self, pbag: &PropertyBag) -> Result<(), NodeError> {
+    fn parse_conditional_processing_attributes(
+        &self,
+        pbag: &PropertyBag<'_>,
+    ) -> Result<(), NodeError> {
         let mut cond = self.cond.get();
 
         for (_key, attr, value) in pbag.iter() {
@@ -416,40 +408,160 @@ impl Node {
         Ok(())
     }
 
+    /// Hands the pbag to the node's state, to apply the presentation attributes
+    fn set_presentation_attributes(&self, pbag: &PropertyBag<'_>) {
+        let mut state = self.state.borrow_mut();
+        match state.parse_presentation_attributes(pbag) {
+            Ok(_) => (),
+            Err(e) => {
+                // FIXME: we'll ignore errors here for now.
+                //
+                // If we set the node to be in error, we expose buggy handling of the
+                // enable-background property; we are not parsing it correctly. This
+                // causes tests/fixtures/reftests/bugs/587721-text-transform.svg to fail
+                // because it has enable-background="new 0 0 1179.75118 687.74173" in the
+                // toplevel svg element.
+                //
+                //   self.set_error(e);
+                //   return;
+
+                rsvg_log!("(attribute error: {})", e);
+            }
+        }
+    }
+
+    /// Implements a very limited CSS selection engine
+    fn set_css_styles(&self, handle: *const RsvgHandle) {
+        // Try to properly support all of the following, including inheritance:
+        // *
+        // #id
+        // tag
+        // tag#id
+        // tag.class
+        // tag.class#id
+        //
+        // This is basically a semi-compliant CSS2 selection engine
+
+        let css_styles = handle::get_css_styles(handle);
+        let mut state = self.state.borrow_mut();
+
+        // *
+        css_styles.lookup_apply("*", &mut state);
+
+        // tag
+        css_styles.lookup_apply(&self.element_name, &mut state);
+
+        if let Some(klazz) = self.get_class() {
+            for cls in klazz.split_whitespace() {
+                let mut found = false;
+
+                if !cls.is_empty() {
+                    // tag.class#id
+                    if let Some(id) = self.get_id() {
+                        let target = format!("{}.{}#{}", self.element_name, cls, id);
+                        found = found || css_styles.lookup_apply(&target, &mut state);
+                    }
+
+                    // .class#id
+                    if let Some(id) = self.get_id() {
+                        let target = format!(".{}#{}", cls, id);
+                        found = found || css_styles.lookup_apply(&target, &mut state);
+                    }
+
+                    // tag.class
+                    let target = format!("{}.{}", self.element_name, cls);
+                    found = found || css_styles.lookup_apply(&target, &mut state);
+
+                    if !found {
+                        // didn't find anything more specific, just apply the class style
+                        let target = format!(".{}", cls);
+                        css_styles.lookup_apply(&target, &mut state);
+                    }
+                }
+            }
+        }
+
+        if let Some(id) = self.get_id() {
+            // id
+            let target = format!("#{}", id);
+            css_styles.lookup_apply(&target, &mut state);
+
+            // tag#id
+            let target = format!("{}#{}", self.element_name, id);
+            css_styles.lookup_apply(&target, &mut state);
+        }
+    }
+
+    /// Looks for the "style" attribute in the pbag, and applies CSS styles from it
+    fn set_style_attribute(&self, pbag: &PropertyBag<'_>) {
+        for (_key, attr, value) in pbag.iter() {
+            match attr {
+                Attribute::Style => {
+                    let mut state = self.state.borrow_mut();
+                    if let Err(e) = state.parse_style_declarations(value) {
+                        self.set_error(e);
+                        break;
+                    }
+                }
+
+                _ => (),
+            }
+        }
+    }
+
+    // Sets the node's state from the style-related attributes in the pbag.  Also applies
+    // CSS rules in our limited way based on the node's tag/class/id.
+    pub fn set_style(&self, handle: *const RsvgHandle, pbag: &PropertyBag<'_>) {
+        self.set_presentation_attributes(pbag);
+        self.set_css_styles(handle);
+        self.set_style_attribute(pbag);
+    }
+
     pub fn set_overridden_properties(&self) {
-        let mut state = self.get_state_mut();
+        let mut state = self.state.borrow_mut();
         self.node_impl.set_overridden_properties(&mut state);
     }
 
     pub fn draw(
         &self,
         node: &RsvgNode,
-        cascaded: &CascadedValues,
-        draw_ctx: &mut DrawingCtx,
+        cascaded: &CascadedValues<'_>,
+        draw_ctx: &mut DrawingCtx<'_>,
         clipping: bool,
-    ) {
-        if self.result.borrow().is_ok() {
+    ) -> Result<(), RenderingError> {
+        if !self.is_in_error() {
             let cr = draw_ctx.get_cairo_context();
             let save_affine = cr.get_matrix();
 
             cr.transform(self.get_transform());
 
-            self.node_impl.draw(node, cascaded, draw_ctx, clipping);
+            let res = self.node_impl.draw(node, cascaded, draw_ctx, clipping);
 
             cr.set_matrix(save_affine);
+
+            res
+        } else {
+            rsvg_log!(
+                "(not rendering element {} because it is in error)",
+                self.get_human_readable_name()
+            );
+
+            Ok(()) // maybe we should actually return a RenderingError::NodeIsInError here?
         }
     }
 
     pub fn set_error(&self, error: NodeError) {
+        rsvg_log!(
+            "(attribute error for {}:\n  {})",
+            self.get_human_readable_name(),
+            error
+        );
+
         *self.result.borrow_mut() = Err(error);
     }
 
     pub fn is_in_error(&self) -> bool {
         self.result.borrow().is_err()
-    }
-
-    pub fn get_result(&self) -> NodeResult {
-        self.result.borrow().clone()
     }
 
     pub fn with_impl<T, F, U>(&self, f: F) -> U
@@ -470,13 +582,19 @@ impl Node {
 
     pub fn draw_children(
         &self,
-        cascaded: &CascadedValues,
-        draw_ctx: &mut DrawingCtx,
+        cascaded: &CascadedValues<'_>,
+        draw_ctx: &mut DrawingCtx<'_>,
         clipping: bool,
-    ) {
+    ) -> Result<(), RenderingError> {
         for child in self.children() {
-            draw_ctx.draw_node_from_stack(&CascadedValues::new(cascaded, &child), &child, clipping);
+            draw_ctx.draw_node_from_stack(
+                &CascadedValues::new(cascaded, &child),
+                &child,
+                clipping,
+            )?;
         }
+
+        Ok(())
     }
 
     pub fn children(&self) -> Children {
@@ -492,8 +610,13 @@ impl Node {
         self.first_child.borrow().is_some()
     }
 
+    pub fn is_overflow(&self) -> bool {
+        let state = self.state.borrow();
+        state.get_specified_values().is_overflow()
+    }
+
     pub fn set_overflow_hidden(&self) {
-        let state = self.get_state_mut();
+        let mut state = self.state.borrow_mut();
         state.values.overflow = SpecifiedValue::Specified(Overflow::Hidden);
     }
 
@@ -522,22 +645,6 @@ impl Node {
     }
 }
 
-// Sigh, rsvg_state_free() is only available if we are being linked into
-// librsvg.so.  In testing mode, we run standalone, so we omit this.
-// Fortunately, in testing mode we don't create "real" nodes with
-// states; we only create stub nodes with ptr::null() for state.
-#[cfg(not(test))]
-impl Drop for Node {
-    fn drop(&mut self) {
-        extern "C" {
-            fn rsvg_state_free(state: *mut RsvgState);
-        }
-        unsafe {
-            rsvg_state_free(self.state);
-        }
-    }
-}
-
 pub fn node_ptr_to_weak(raw_parent: *const RsvgNode) -> Option<Weak<Node>> {
     if raw_parent.is_null() {
         None
@@ -550,6 +657,7 @@ pub fn node_ptr_to_weak(raw_parent: *const RsvgNode) -> Option<Weak<Node>> {
 pub fn boxed_node_new(
     node_type: NodeType,
     raw_parent: *const RsvgNode,
+    element_name: &str,
     id: Option<&str>,
     class: Option<&str>,
     node_impl: Box<NodeTrait>,
@@ -557,9 +665,9 @@ pub fn boxed_node_new(
     box_node(Rc::new(Node::new(
         node_type,
         node_ptr_to_weak(raw_parent),
+        element_name,
         id,
         class,
-        rsvg_state_new(),
         node_impl,
     )))
 }
@@ -615,14 +723,6 @@ impl DoubleEndedIterator for Children {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn rsvg_node_get_type(raw_node: *const RsvgNode) -> NodeType {
-    assert!(!raw_node.is_null());
-    let node: &RsvgNode = unsafe { &*raw_node };
-
-    node.get_type()
-}
-
 pub fn box_node(node: RsvgNode) -> *mut RsvgNode {
     Box::into_raw(Box::new(node))
 }
@@ -658,25 +758,6 @@ pub extern "C" fn rsvg_node_unref(raw_node: *mut RsvgNode) -> *mut RsvgNode {
 }
 
 #[no_mangle]
-pub extern "C" fn rsvg_node_is_same(
-    raw_node1: *const RsvgNode,
-    raw_node2: *const RsvgNode,
-) -> glib_sys::gboolean {
-    let is_same = if raw_node1.is_null() && raw_node2.is_null() {
-        true
-    } else if !raw_node1.is_null() && !raw_node2.is_null() {
-        let node1: &RsvgNode = unsafe { &*raw_node1 };
-        let node2: &RsvgNode = unsafe { &*raw_node2 };
-
-        Rc::ptr_eq(node1, node2)
-    } else {
-        false
-    };
-
-    is_same.to_glib()
-}
-
-#[no_mangle]
 pub extern "C" fn rsvg_node_add_child(raw_node: *mut RsvgNode, raw_child: *const RsvgNode) {
     assert!(!raw_node.is_null());
     assert!(!raw_child.is_null());
@@ -684,39 +765,6 @@ pub extern "C" fn rsvg_node_add_child(raw_node: *mut RsvgNode, raw_child: *const
     let child: &RsvgNode = unsafe { &*raw_child };
 
     node.add_child(child);
-}
-
-#[no_mangle]
-pub extern "C" fn rsvg_node_register_in_defs(raw_node: *const RsvgNode, defs: *mut RsvgDefs) {
-    assert!(!raw_node.is_null());
-    assert!(!defs.is_null());
-
-    let node: &RsvgNode = unsafe { &*raw_node };
-
-    node.register(node, defs);
-}
-
-#[no_mangle]
-pub extern "C" fn rsvg_node_set_attribute_parse_error(
-    raw_node: *const RsvgNode,
-    attr_name: *const libc::c_char,
-    description: *const libc::c_char,
-) {
-    assert!(!raw_node.is_null());
-    let node: &RsvgNode = unsafe { &*raw_node };
-
-    assert!(!attr_name.is_null());
-    assert!(!description.is_null());
-
-    unsafe {
-        let attr_name = utf8_cstr(attr_name);
-        let attr = Attribute::from_str(attr_name).unwrap();
-
-        node.set_error(NodeError::parse_error(
-            attr,
-            ParseError::new(&String::from_glib_none(description)),
-        ));
-    }
 }
 
 #[no_mangle]
@@ -779,27 +827,17 @@ pub extern "C" fn rsvg_node_children_iter_next(
     }
 }
 
-#[no_mangle]
-pub extern "C" fn rsvg_root_node_cascade(raw_node: *const RsvgNode) {
-    assert!(!raw_node.is_null());
-    let node: &RsvgNode = unsafe { &*raw_node };
-
-    let values = ComputedValues::default();
-
-    node.cascade(&values)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use handle::RsvgHandle;
+    use std::mem;
     use std::rc::Rc;
-    use std::{mem, ptr};
 
     struct TestNodeImpl {}
 
     impl NodeTrait for TestNodeImpl {
-        fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, _: &PropertyBag) -> NodeResult {
+        fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, _: &PropertyBag<'_>) -> NodeResult {
             Ok(())
         }
     }
@@ -809,9 +847,9 @@ mod tests {
         let node = Rc::new(Node::new(
             NodeType::Path,
             None,
+            "path",
             None,
             None,
-            ptr::null_mut(),
             Box::new(TestNodeImpl {}),
         ));
 
@@ -835,47 +873,19 @@ mod tests {
         let node = Rc::new(Node::new(
             NodeType::Path,
             None,
+            "path",
             None,
             None,
-            ptr::null_mut(),
             Box::new(TestNodeImpl {}),
         ));
 
         let ref1 = box_node(node);
+        let node1: &RsvgNode = unsafe { &*ref1 };
 
         let ref2 = rsvg_node_ref(ref1);
+        let node2: &RsvgNode = unsafe { &*ref2 };
 
-        assert!(rsvg_node_is_same(ref1, ref2) == true.to_glib());
-
-        rsvg_node_unref(ref1);
-        rsvg_node_unref(ref2);
-    }
-
-    #[test]
-    fn different_nodes_have_different_pointers() {
-        let node1 = Rc::new(Node::new(
-            NodeType::Path,
-            None,
-            None,
-            None,
-            ptr::null_mut(),
-            Box::new(TestNodeImpl {}),
-        ));
-
-        let ref1 = box_node(node1);
-
-        let node2 = Rc::new(Node::new(
-            NodeType::Path,
-            None,
-            None,
-            None,
-            ptr::null_mut(),
-            Box::new(TestNodeImpl {}),
-        ));
-
-        let ref2 = box_node(node2);
-
-        assert!(rsvg_node_is_same(ref1, ref2) == false.to_glib());
+        assert!(Rc::ptr_eq(node1, node2));
 
         rsvg_node_unref(ref1);
         rsvg_node_unref(ref2);
@@ -886,9 +896,9 @@ mod tests {
         let node = Rc::new(Node::new(
             NodeType::Path,
             None,
+            "path",
             None,
             None,
-            ptr::null_mut(),
             Box::new(TestNodeImpl {}),
         ));
 
@@ -900,18 +910,18 @@ mod tests {
         let node = Rc::new(Node::new(
             NodeType::Path,
             None,
+            "path",
             None,
             None,
-            ptr::null_mut(),
             Box::new(TestNodeImpl {}),
         ));
 
         let child = Rc::new(Node::new(
             NodeType::Path,
             Some(Rc::downgrade(&node)),
+            "path",
             None,
             None,
-            ptr::null_mut(),
             Box::new(TestNodeImpl {}),
         ));
 
@@ -926,27 +936,27 @@ mod tests {
         let node = Rc::new(Node::new(
             NodeType::Path,
             None,
+            "path",
             None,
             None,
-            ptr::null_mut(),
             Box::new(TestNodeImpl {}),
         ));
 
         let child = Rc::new(Node::new(
             NodeType::Path,
             Some(Rc::downgrade(&node)),
+            "path",
             None,
             None,
-            ptr::null_mut(),
             Box::new(TestNodeImpl {}),
         ));
 
         let second_child = Rc::new(Node::new(
             NodeType::Path,
             Some(Rc::downgrade(&node)),
+            "path",
             None,
             None,
-            ptr::null_mut(),
             Box::new(TestNodeImpl {}),
         ));
 
@@ -974,27 +984,27 @@ mod tests {
         let node = Rc::new(Node::new(
             NodeType::Path,
             None,
+            "path",
             None,
             None,
-            ptr::null_mut(),
             Box::new(TestNodeImpl {}),
         ));
 
         let child = Rc::new(Node::new(
             NodeType::Path,
             Some(Rc::downgrade(&node)),
+            "path",
             None,
             None,
-            ptr::null_mut(),
             Box::new(TestNodeImpl {}),
         ));
 
         let second_child = Rc::new(Node::new(
             NodeType::Path,
             Some(Rc::downgrade(&node)),
+            "path",
             None,
             None,
-            ptr::null_mut(),
             Box::new(TestNodeImpl {}),
         ));
 

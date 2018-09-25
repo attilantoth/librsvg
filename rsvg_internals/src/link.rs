@@ -9,6 +9,7 @@ use std::cell::RefCell;
 
 use attributes::Attribute;
 use drawing_ctx::DrawingCtx;
+use error::RenderingError;
 use handle::RsvgHandle;
 use node::*;
 use property_bag::PropertyBag;
@@ -26,7 +27,7 @@ impl NodeLink {
 }
 
 impl NodeTrait for NodeLink {
-    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag) -> NodeResult {
+    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag<'_>) -> NodeResult {
         for (_key, attr, value) in pbag.iter() {
             match attr {
                 Attribute::XlinkHref => *self.link.borrow_mut() = Some(value.to_owned()),
@@ -41,10 +42,10 @@ impl NodeTrait for NodeLink {
     fn draw(
         &self,
         node: &RsvgNode,
-        cascaded: &CascadedValues,
-        draw_ctx: &mut DrawingCtx,
+        cascaded: &CascadedValues<'_>,
+        draw_ctx: &mut DrawingCtx<'_>,
         clipping: bool,
-    ) {
+    ) -> Result<(), RenderingError> {
         let link = self.link.borrow();
 
         let cascaded = CascadedValues::new(cascaded, node);
@@ -59,22 +60,26 @@ impl NodeTrait for NodeLink {
                 let cr = dc.get_cairo_context();
 
                 cr.tag_begin(CAIRO_TAG_LINK, attributes.as_ref().map(|i| i.as_str()));
-                node.draw_children(&cascaded, dc, clipping);
+
+                let res = node.draw_children(&cascaded, dc, clipping);
+
                 cr.tag_end(CAIRO_TAG_LINK);
+
+                res
             } else {
                 node.draw_children(&cascaded, dc, clipping)
             }
-        });
+        })
     }
 }
 
 /// escape quotes and backslashes with backslash
-fn escape_value(value: &str) -> Cow<str> {
+fn escape_value(value: &str) -> Cow<'_, str> {
     lazy_static! {
         static ref REGEX: Regex = Regex::new(r"['\\]").unwrap();
     }
 
-    REGEX.replace_all(value, |caps: &Captures| {
+    REGEX.replace_all(value, |caps: &Captures<'_>| {
         match caps.get(0).unwrap().as_str() {
             "'" => "\\'".to_owned(),
             "\\" => "\\\\".to_owned(),

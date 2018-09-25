@@ -25,18 +25,15 @@ librsvg_@RSVG_API_MAJOR_VERSION@_la_SOURCES =	\
 	librsvg/librsvg-features.c 		\
 	librsvg/librsvg-features.h 		\
 	librsvg/rsvg-attributes.h		\
-	librsvg/rsvg-base-file-util.c 		\
 	librsvg/rsvg-base.c			\
 	librsvg/rsvg-cairo.h			\
 	librsvg/rsvg-css.h 			\
-	librsvg/rsvg-defs.c 			\
-	librsvg/rsvg-defs.h 			\
-	librsvg/rsvg-file-util.c		\
 	librsvg/rsvg-handle.c			\
 	librsvg/rsvg-io.c			\
 	librsvg/rsvg-io.h			\
 	librsvg/rsvg-load.c			\
 	librsvg/rsvg-load.h			\
+	librsvg/rsvg-pixbuf.c			\
 	librsvg/rsvg-private.h 			\
 	librsvg/rsvg-size-callback.c		\
 	librsvg/rsvg-size-callback.h		\
@@ -70,9 +67,8 @@ RUST_SRC =							\
 	rsvg_internals/src/filters/flood.rs			\
 	rsvg_internals/src/filters/gaussian_blur.rs		\
 	rsvg_internals/src/filters/image.rs			\
-	rsvg_internals/src/filters/light/diffuse_lighting.rs	\
 	rsvg_internals/src/filters/light/light_source.rs	\
-	rsvg_internals/src/filters/light/specular_lighting.rs	\
+	rsvg_internals/src/filters/light/lighting.rs		\
 	rsvg_internals/src/filters/light/mod.rs			\
 	rsvg_internals/src/filters/merge.rs			\
 	rsvg_internals/src/filters/morphology.rs		\
@@ -84,12 +80,14 @@ RUST_SRC =							\
 	rsvg_internals/src/filters/turbulence.rs		\
 	rsvg_internals/src/error.rs				\
 	rsvg_internals/src/float_eq_cairo.rs			\
+	rsvg_internals/src/font_props.rs			\
 	rsvg_internals/src/gradient.rs				\
 	rsvg_internals/src/handle.rs				\
 	rsvg_internals/src/image.rs				\
 	rsvg_internals/src/iri.rs				\
 	rsvg_internals/src/length.rs				\
 	rsvg_internals/src/lib.rs				\
+	rsvg_internals/src/log.rs				\
 	rsvg_internals/src/link.rs				\
 	rsvg_internals/src/load.rs				\
 	rsvg_internals/src/marker.rs				\
@@ -114,16 +112,20 @@ RUST_SRC =							\
 	rsvg_internals/src/structure.rs				\
 	rsvg_internals/src/text.rs				\
 	rsvg_internals/src/transform.rs				\
+	rsvg_internals/src/tree.rs				\
 	rsvg_internals/src/unitinterval.rs			\
 	rsvg_internals/src/util.rs				\
 	rsvg_internals/src/viewbox.rs				\
 	rsvg_internals/src/viewport.rs
 
-RUST_EXTRA = 					\
-	Cargo.lock				\
-	cargo-vendor-config			\
-	rsvg_internals/benches/box_blur.rs	\
-	rsvg_internals/benches/pixel_iterators.rs
+RUST_EXTRA = 						\
+	Cargo.lock					\
+	cargo-vendor-config				\
+	rsvg_internals/benches/box_blur.rs		\
+	rsvg_internals/benches/composite.rs		\
+	rsvg_internals/benches/lighting.rs		\
+	rsvg_internals/benches/pixel_iterators.rs	\
+	rsvg_internals/benches/srgb.rs
 
 if DEBUG_RELEASE
 CARGO_RELEASE_ARGS=
@@ -151,10 +153,17 @@ clean-local:
 	cd $(top_srcdir) && \
 	CARGO_TARGET_DIR=$(CARGO_TARGET_DIR) cargo clean
 
+distcheck-hook:
+	if test -z "${DESTDIR}";						\
+	then									\
+		echo "Please specify DESTDIR=/tmp/foo so distcheck will work";	\
+		exit 1;								\
+	fi
+
 dist-hook:
-	(cd $(distdir) && \
-	cargo vendor -q && \
-	mkdir .cargo && \
+	(cd $(distdir) &&							\
+	cargo vendor -q &&							\
+	mkdir .cargo &&								\
 	cp cargo-vendor-config .cargo/config)
 
 $(RUST_LIB): $(RUST_SRC)
@@ -188,9 +197,9 @@ librsvg_@RSVG_API_MAJOR_VERSION@_la_LDFLAGS = \
 	$(AM_LDFLAGS)
 
 librsvg_@RSVG_API_MAJOR_VERSION@_la_LIBADD = \
+	$(RUST_LIB)		\
 	$(LIBRSVG_LIBS) 	\
 	$(LIBM)			\
-	$(RUST_LIB)		\
 	$(DLOPEN_LIBS)
 
 librsvgincdir = $(includedir)/librsvg-$(RSVG_API_VERSION)/librsvg
@@ -279,7 +288,7 @@ EXTRA_DIST =				\
 
 CLEANFILES = \
 	$(enum_sources) \
-	s-enum-types-h s-enum-types-c
+	librsvg/s-enum-types-h librsvg/s-enum-types-c
 
 ## Put `exec' in the name because this should be installed by
 ## `install-exec', not `install-data'.
@@ -299,7 +308,7 @@ librsvg/s-enum-types-h: $(headers) Makefile
 		$(headers) ) > librsvg/tmp-librsvg-enum-types.h \
 	&& (cmp -s librsvg/tmp-librsvg-enum-types.h librsvg/librsvg-enum-types.h || cp librsvg/tmp-librsvg-enum-types.h librsvg/librsvg-enum-types.h ) \
 	&& rm -f librsvg/tmp-librsvg-enum-types.h	\
-	&& echo timestamp > $(@F)
+	&& echo timestamp > $@
 
 librsvg/librsvg-enum-types.c: librsvg/s-enum-types-c librsvg/librsvg-enum-types.h
 	@true
@@ -314,7 +323,7 @@ librsvg/s-enum-types-c: $(headers) Makefile
 		$(headers) ) > librsvg/tmp-librsvg-enum-types.c \
 	&& (cmp -s librsvg/tmp-librsvg-enum-types.c librsvg/librsvg-enum-types.c || cp librsvg/tmp-librsvg-enum-types.c librsvg/librsvg-enum-types.c ) \
 	&& rm -f librsvg/tmp-librsvg-enum-types.c \
-	&& echo timestamp > $(@F)
+	&& echo timestamp > $@
 
 DISTCHECK_CONFIGURE_FLAGS = --enable-gtk-doc
 
@@ -365,7 +374,7 @@ VAPIGEN_VAPIS = librsvg-$(RSVG_API_VERSION).vapi
 
 librsvg_@RSVG_API_VERSION_U@_vapi_DEPS = gio-2.0 cairo
 librsvg_@RSVG_API_VERSION_U@_vapi_METADATADIRS = $(srcdir)
-librsvg_@RSVG_API_VERSION_U@_vapi_FILES = Rsvg-$(RSVG_API_VERSION).gir Rsvg-$(RSVG_API_VERSION)-custom.vala
+librsvg_@RSVG_API_VERSION_U@_vapi_FILES = Rsvg-$(RSVG_API_VERSION).gir $(srcdir)/Rsvg-$(RSVG_API_VERSION)-custom.vala
 
 vapidir = $(datadir)/vala/vapi
 vapi_DATA = $(VAPIGEN_VAPIS)
@@ -421,14 +430,3 @@ endif # HAVE_INTROSPECTION
 $(MSVCPROJ_GENERATED): $(top_builddir)/win32/vs12/rsvg.vs12.headers
 
 EXTRA_DIST += $(MSVCPROJ_GENERATED)
-
-# ChangeLog generation
-
-ChangeLog:
-	$(AM_V_GEN) if test -d $(top_srcdir)/.git; then \
-		GIT_DIR="$(top_srcdir)/.git" git log --stat > $@; \
-	fi
-
-dist: ChangeLog
-
-.PHONY: ChangeLog

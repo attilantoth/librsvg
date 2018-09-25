@@ -3,6 +3,7 @@ use std::collections::HashMap;
 
 use attributes::Attribute;
 use clip_path::NodeClipPath;
+use defs::{Defs, RsvgDefs};
 use filters::{
     blend::Blend,
     color_matrix::ColorMatrix,
@@ -13,11 +14,7 @@ use filters::{
     flood::Flood,
     gaussian_blur::GaussianBlur,
     image::Image,
-    light::{
-        diffuse_lighting::DiffuseLighting,
-        light_source::LightSource,
-        specular_lighting::SpecularLighting,
-    },
+    light::{light_source::LightSource, lighting::Lighting},
     merge::{Merge, MergeNode},
     morphology::Morphology,
     node::NodeFilter,
@@ -35,7 +32,6 @@ use node::*;
 use pattern::NodePattern;
 use property_bag::PropertyBag;
 use shapes::{NodeCircle, NodeEllipse, NodeLine, NodePath, NodePoly, NodeRect};
-use state::parse_style_attrs;
 use stop::NodeStop;
 use structure::{NodeDefs, NodeGroup, NodeSvg, NodeSwitch, NodeSymbol, NodeUse};
 use text::{NodeTRef, NodeTSpan, NodeText};
@@ -44,11 +40,19 @@ use util::utf8_cstr;
 macro_rules! node_create_fn {
     ($name:ident, $node_type:ident, $new_fn:expr) => {
         fn $name(
+            element_name: &str,
             id: Option<&str>,
             class: Option<&str>,
             parent: *const RsvgNode,
         ) -> *const RsvgNode {
-            boxed_node_new(NodeType::$node_type, parent, id, class, Box::new($new_fn()))
+            boxed_node_new(
+                NodeType::$node_type,
+                parent,
+                element_name,
+                id,
+                class,
+                Box::new($new_fn()),
+            )
         }
     };
 }
@@ -96,7 +100,7 @@ node_create_fn!(create_defs, Defs, NodeDefs::new);
 node_create_fn!(
     create_diffuse_lighting,
     FilterPrimitiveDiffuseLighting,
-    DiffuseLighting::new
+    Lighting::new_diffuse
 );
 node_create_fn!(
     create_distant_light,
@@ -154,7 +158,7 @@ node_create_fn!(create_rect, Rect, NodeRect::new);
 node_create_fn!(
     create_specular_lighting,
     FilterPrimitiveSpecularLighting,
-    SpecularLighting::new
+    Lighting::new_specular
 );
 node_create_fn!(create_spot_light, LightSource, LightSource::new_spot_light);
 node_create_fn!(create_stop, Stop, NodeStop::new);
@@ -172,7 +176,7 @@ node_create_fn!(
 );
 node_create_fn!(create_use, Use, NodeUse::new);
 
-type NodeCreateFn = fn(Option<&str>, Option<&str>, *const RsvgNode) -> *const RsvgNode;
+type NodeCreateFn = fn(&str, Option<&str>, Option<&str>, *const RsvgNode) -> *const RsvgNode;
 
 lazy_static! {
     // Lines in comments are elements that we don't support.
@@ -271,13 +275,16 @@ lazy_static! {
 pub extern "C" fn rsvg_load_new_node(
     raw_name: *const libc::c_char,
     parent: *const RsvgNode,
-    pbag: *const PropertyBag,
+    pbag: *const PropertyBag<'_>,
+    defs: *mut RsvgDefs,
 ) -> *const RsvgNode {
     assert!(!raw_name.is_null());
     assert!(!pbag.is_null());
+    assert!(!defs.is_null());
 
     let name = unsafe { utf8_cstr(raw_name) };
     let pbag = unsafe { &*pbag };
+    let defs = unsafe { &mut *(defs as *mut Defs) };
 
     let mut id = None;
     let mut class = None;
@@ -295,7 +302,6 @@ pub extern "C" fn rsvg_load_new_node(
         // Whenever we encounter a node we don't understand, represent it as a defs.
         // This is like a group, but it doesn't do any rendering of children.  The
         // effect is that we will ignore all children of unknown elements.
-        //
         None => &(true, create_defs as NodeCreateFn),
     };
 
@@ -303,21 +309,27 @@ pub extern "C" fn rsvg_load_new_node(
         class = None;
     };
 
-    create_fn(id, class, parent)
+    let node = create_fn(name, id, class, parent);
+    assert!(!node.is_null());
+
+    if id.is_some() {
+        let n = unsafe { &*node };
+        defs.insert(id.unwrap(), n);
+    }
+
+    node
 }
 
 #[no_mangle]
 pub extern "C" fn rsvg_load_set_node_atts(
     handle: *const RsvgHandle,
     raw_node: *mut RsvgNode,
-    tag: *const libc::c_char,
-    pbag: *const PropertyBag,
+    pbag: *const PropertyBag<'_>,
 ) {
     assert!(!raw_node.is_null());
     assert!(!pbag.is_null());
 
     let node: &RsvgNode = unsafe { &*raw_node };
-    let tag = unsafe { utf8_cstr(tag) };
     let pbag = unsafe { &*pbag };
 
     node.set_atts(node, handle, pbag);
@@ -326,8 +338,25 @@ pub extern "C" fn rsvg_load_set_node_atts(
     // attributes until the end, when sax_end_element_cb() calls
     // rsvg_node_svg_apply_atts()
     if node.get_type() != NodeType::Svg {
-        parse_style_attrs(handle, node, tag, pbag);
+        node.set_style(handle, pbag);
     }
 
     node.set_overridden_properties();
+}
+
+#[no_mangle]
+pub extern "C" fn rsvg_load_set_svg_node_atts(
+    handle: *const RsvgHandle,
+    raw_node: *const RsvgNode,
+) {
+    assert!(!raw_node.is_null());
+    let node: &RsvgNode = unsafe { &*raw_node };
+
+    if node.get_type() != NodeType::Svg {
+        return;
+    }
+
+    node.with_impl(|svg: &NodeSvg| {
+        svg.set_delayed_style(node, handle);
+    });
 }

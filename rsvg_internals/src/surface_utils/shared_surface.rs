@@ -1,4 +1,6 @@
 //! Shared access to Cairo image surfaces.
+use std::cmp::min;
+use std::marker::PhantomData;
 use std::ptr::NonNull;
 
 use cairo::prelude::SurfaceExt;
@@ -6,6 +8,7 @@ use cairo::{self, ImageSurface};
 use cairo_sys;
 use glib::translate::{Stash, ToGlibPtr};
 use nalgebra::{storage::Storage, Dim, Matrix};
+use rayon;
 
 use filters::context::IRect;
 use srgb;
@@ -65,6 +68,45 @@ pub struct SharedImageSurface {
     surface_type: SurfaceType,
 }
 
+// The access is read-only, the ref-counting on an `ImageSurface` is atomic.
+unsafe impl Sync for SharedImageSurface {}
+
+/// A compile-time blur direction variable.
+pub trait BlurDirection {
+    const IS_VERTICAL: bool;
+}
+
+/// Vertical blur direction.
+pub enum Vertical {}
+/// Horizontal blur direction.
+pub enum Horizontal {}
+
+impl BlurDirection for Vertical {
+    const IS_VERTICAL: bool = true;
+}
+
+impl BlurDirection for Horizontal {
+    const IS_VERTICAL: bool = false;
+}
+
+/// A compile-time alpha-only marker variable.
+pub trait IsAlphaOnly {
+    const IS_ALPHA_ONLY: bool;
+}
+
+/// Alpha-only.
+pub enum AlphaOnly {}
+/// Not alpha-only.
+pub enum NotAlphaOnly {}
+
+impl IsAlphaOnly for AlphaOnly {
+    const IS_ALPHA_ONLY: bool = true;
+}
+
+impl IsAlphaOnly for NotAlphaOnly {
+    const IS_ALPHA_ONLY: bool = false;
+}
+
 impl SharedImageSurface {
     /// Creates a `SharedImageSurface` from a unique `ImageSurface`.
     ///
@@ -85,9 +127,9 @@ impl SharedImageSurface {
             return Err(surface.status());
         }
 
-        let data_ptr = NonNull::new(unsafe {
-            cairo_sys::cairo_image_surface_get_data(surface.to_raw_none())
-        }).unwrap();
+        let data_ptr =
+            NonNull::new(unsafe { cairo_sys::cairo_image_surface_get_data(surface.to_raw_none()) })
+                .unwrap();
 
         let width = surface.get_width();
         let height = surface.get_height();
@@ -136,6 +178,12 @@ impl SharedImageSurface {
         self.height
     }
 
+    /// Returns the surface stride.
+    #[inline]
+    pub fn stride(&self) -> isize {
+        self.stride
+    }
+
     /// Returns `true` if the surface contains meaningful data only in the alpha channel.
     #[inline]
     pub fn is_alpha_only(&self) -> bool {
@@ -161,28 +209,16 @@ impl SharedImageSurface {
                 .offset(y as isize * self.stride + x as isize * 4) as *const u32)
         };
 
-        Pixel {
-            r: ((value >> 16) & 0xFF) as u8,
-            g: ((value >> 8) & 0xFF) as u8,
-            b: (value & 0xFF) as u8,
-            a: ((value >> 24) & 0xFF) as u8,
-        }
+        Pixel::from_u32(value)
     }
 
-    /// Retrieves the pixel value if it is within `bounds`, otherwise returns a transparent black
-    /// pixel.
+    /// Retrieves the pixel value by offset into the pixel data array.
     #[inline]
-    pub fn get_pixel_or_transparent(&self, bounds: IRect, x: i32, y: i32) -> Pixel {
-        if bounds.contains(x, y) {
-            self.get_pixel(x as u32, y as u32)
-        } else {
-            Pixel {
-                r: 0,
-                g: 0,
-                b: 0,
-                a: 0,
-            }
-        }
+    pub fn get_pixel_by_offset(&self, offset: isize) -> Pixel {
+        assert!(offset < self.stride as isize * self.height as isize);
+
+        let value = unsafe { *(self.data_ptr.as_ptr().offset(offset) as *const u32) };
+        Pixel::from_u32(value)
     }
 
     /// Calls `set_source_surface()` on the given Cairo context.
@@ -376,7 +412,7 @@ impl SharedImageSurface {
                         a += f64::from(pixel.a) * factor;
                     }
 
-                    let convert = |x: f64| clamp(x, 0.0, 255.0).round() as u8;
+                    let convert = |x: f64| (clamp(x, 0.0, 255.0) + 0.5) as u8;
 
                     let output_pixel = Pixel {
                         r: 0,
@@ -413,7 +449,7 @@ impl SharedImageSurface {
                         a += f64::from(pixel.a) * factor;
                     }
 
-                    let convert = |x: f64| clamp(x, 0.0, 255.0).round() as u8;
+                    let convert = |x: f64| (clamp(x, 0.0, 255.0) + 0.5) as u8;
 
                     let output_pixel = Pixel {
                         r: convert(r),
@@ -441,20 +477,139 @@ impl SharedImageSurface {
     /// Panics if `kernel_size` is `0` or if `target >= kernel_size`.
     // This is public (and not inlined into box_blur()) for the purpose of accessing it from the
     // benchmarks.
-    pub fn box_blur_loop(
+    pub fn box_blur_loop<B: BlurDirection, A: IsAlphaOnly>(
         &self,
         output_surface: &mut cairo::ImageSurface,
         bounds: IRect,
         kernel_size: usize,
         target: usize,
-        vertical: bool,
     ) {
         assert_ne!(kernel_size, 0);
         assert!(target < kernel_size);
+        assert_eq!(self.is_alpha_only(), A::IS_ALPHA_ONLY);
 
-        let output_stride = output_surface.get_stride() as usize;
         {
-            let mut output_data = output_surface.get_data().unwrap();
+            // The following code is needed for a parallel implementation of the blur loop. The
+            // blurring is done either for each row or for each column of pixels, depending on the
+            // value of `vertical`, independently of the others. Naturally, we want to run the
+            // outer loop on a thread pool.
+            //
+            // The case of `vertical == false` is simple since the input image slice can be
+            // partitioned into chunks for each row of pixels and processed in parallel with rayon.
+            // The case of `vertical == true`, however, is more involved because we can't just make
+            // mutable slices for all pixel columns (they would be overlapping which is forbidden
+            // by the aliasing rules).
+            //
+            // This is where the following struct comes into play: it stores a sub-slice of the
+            // pixel data and can be split at any row or column into two parts (similar to
+            // slice::split_at_mut()).
+            struct UnsafeSendPixelData<'a> {
+                width: u32,
+                height: u32,
+                stride: isize,
+                ptr: NonNull<u8>,
+                _marker: PhantomData<&'a mut ()>,
+            }
+
+            unsafe impl<'a> Send for UnsafeSendPixelData<'a> {}
+
+            impl<'a> UnsafeSendPixelData<'a> {
+                /// Creates a new `UnsafeSendPixelData`.
+                ///
+                /// # Safety
+                /// You must call `cairo_surface_mark_dirty()` on the surface once all instances of
+                /// `UnsafeSendPixelData` are dropped to make sure the pixel changes are committed
+                /// to Cairo.
+                #[inline]
+                unsafe fn new(surface: &mut cairo::ImageSurface) -> Self {
+                    assert_eq!(surface.get_format(), cairo::Format::ARgb32);
+                    let ptr = surface.get_data().unwrap().as_mut_ptr();
+
+                    Self {
+                        width: surface.get_width() as u32,
+                        height: surface.get_height() as u32,
+                        stride: surface.get_stride() as isize,
+                        ptr: NonNull::new(ptr).unwrap(),
+                        _marker: PhantomData,
+                    }
+                }
+
+                /// Sets a pixel value at the given coordinates.
+                #[inline]
+                fn set_pixel(&mut self, pixel: Pixel, x: u32, y: u32) {
+                    assert!(x < self.width);
+                    assert!(y < self.height);
+
+                    let value = pixel.to_u32();
+
+                    unsafe {
+                        let ptr = self
+                            .ptr
+                            .as_ptr()
+                            .offset(y as isize * self.stride + x as isize * 4)
+                            as *mut u32;
+                        *ptr = value;
+                    }
+                }
+
+                /// Splits this `UnsafeSendPixelData` into two at the given row.
+                ///
+                /// The first one contains rows `0..index` (`index` not included) and the second one
+                /// contains rows `index..height`.
+                #[inline]
+                fn split_at_row(self, index: u32) -> (Self, Self) {
+                    assert!(index <= self.height);
+
+                    (
+                        UnsafeSendPixelData {
+                            width: self.width,
+                            height: index,
+                            stride: self.stride,
+                            ptr: self.ptr,
+                            _marker: PhantomData,
+                        },
+                        UnsafeSendPixelData {
+                            width: self.width,
+                            height: self.height - index,
+                            stride: self.stride,
+                            ptr: NonNull::new(unsafe {
+                                self.ptr.as_ptr().offset(index as isize * self.stride)
+                            }).unwrap(),
+                            _marker: PhantomData,
+                        },
+                    )
+                }
+
+                /// Splits this `UnsafeSendPixelData` into two at the given column.
+                ///
+                /// The first one contains columns `0..index` (`index` not included) and the second
+                /// one contains columns `index..width`.
+                #[inline]
+                fn split_at_column(self, index: u32) -> (Self, Self) {
+                    assert!(index <= self.width);
+
+                    (
+                        UnsafeSendPixelData {
+                            width: index,
+                            height: self.height,
+                            stride: self.stride,
+                            ptr: self.ptr,
+                            _marker: PhantomData,
+                        },
+                        UnsafeSendPixelData {
+                            width: self.width - index,
+                            height: self.height,
+                            stride: self.stride,
+                            ptr: NonNull::new(unsafe {
+                                self.ptr.as_ptr().offset(index as isize * 4)
+                            }).unwrap(),
+                            _marker: PhantomData,
+                        },
+                    )
+                }
+            }
+
+            let output_data = unsafe { UnsafeSendPixelData::new(output_surface) };
 
             // Shift is target into the opposite direction.
             let shift = (kernel_size - target) as i32;
@@ -465,103 +620,142 @@ impl SharedImageSurface {
             let compute = |x: u32| (f64::from(x) / kernel_size_f64 + 0.5) as u8;
 
             // Depending on `vertical`, we're blurring either horizontally line-by-line, or
-            // vertically column-by-column. In the code below, the main axis is the
-            // axis along which the blurring happens (so if `vertical` is false, the
-            // main axis is the horizontal axis). The other axis is the outer loop
-            // axis. The code uses `i` and `j` for the other axis and main axis
-            // coordinates, respectively.
-            let (main_axis_min, main_axis_max, other_axis_min, other_axis_max) = if vertical {
+            // vertically column-by-column. In the code below, the main axis is the axis along
+            // which the blurring happens (so if `vertical` is false, the main axis is the
+            // horizontal axis). The other axis is the outer loop axis. The code uses `i` and `j`
+            // for the other axis and main axis coordinates, respectively.
+            let (main_axis_min, main_axis_max, other_axis_min, other_axis_max) = if B::IS_VERTICAL {
                 (bounds.y0, bounds.y1, bounds.x0, bounds.x1)
             } else {
                 (bounds.x0, bounds.x1, bounds.y0, bounds.y1)
             };
 
-            // Helper functions for getting and setting the pixels.
+            // Helper function for getting the pixels.
             let pixel = |i, j| {
-                let (x, y) = if vertical { (i, j) } else { (j, i) };
+                let (x, y) = if B::IS_VERTICAL { (i, j) } else { (j, i) };
 
-                self.get_pixel_or_transparent(bounds, x, y)
+                self.get_pixel(x as u32, y as u32)
             };
 
-            let mut set_pixel = |i, j, pixel| {
-                let (x, y) = if vertical { (i, j) } else { (j, i) };
-
-                output_data.set_pixel(output_stride, pixel, x, y);
+            // The following loop assumes the first row or column of `output_data` is the first row
+            // or column inside `bounds`.
+            let mut output_data = if B::IS_VERTICAL {
+                output_data.split_at_column(bounds.x0 as u32).1
+            } else {
+                output_data.split_at_row(bounds.y0 as u32).1
             };
 
-            for i in other_axis_min..other_axis_max {
-                // The idea is that since all weights of the box blur kernel are equal, for each
-                // step along the main axis, instead of recomputing the full sum,
-                // we can take the previous sum, subtract the "oldest" pixel value
-                // and add the "newest" pixel value.
-                //
-                // The sum is u32 so that it can fit MAXIMUM_KERNEL_SIZE * 255.
-                let mut sum_r = 0;
-                let mut sum_g = 0;
-                let mut sum_b = 0;
-                let mut sum_a = 0;
+            rayon::scope(|s| {
+                for i in other_axis_min..other_axis_max {
+                    // Split off one row or column and launch its processing on another thread.
+                    // Thanks to the initial split before the loop, there's no special case for the
+                    // very first split.
+                    let (mut current, remaining) = if B::IS_VERTICAL {
+                        output_data.split_at_column(1)
+                    } else {
+                        output_data.split_at_row(1)
+                    };
 
-                // The whole sum needs to be computed for the first pixel. However, we know that
-                // values outside of bounds are transparent, so the loop starts on
-                // the first pixel in bounds.
-                for j in main_axis_min..main_axis_min + shift {
-                    let Pixel { r, g, b, a } = pixel(i, j);
+                    output_data = remaining;
 
-                    if !self.is_alpha_only() {
-                        sum_r += u32::from(r);
-                        sum_g += u32::from(g);
-                        sum_b += u32::from(b);
-                    }
+                    s.spawn(move |_| {
+                        // Helper function for setting the pixels.
+                        let mut set_pixel = |j, pixel| {
+                            // We're processing rows or columns one-by-one, so the other coordinate
+                            // is always 0.
+                            let (x, y) = if B::IS_VERTICAL { (0, j) } else { (j, 0) };
+                            current.set_pixel(pixel, x, y);
+                        };
 
-                    sum_a += u32::from(a);
+                        // The idea is that since all weights of the box blur kernel are equal, for
+                        // each step along the main axis, instead of recomputing the full sum, we
+                        // can take the previous sum, subtract the "oldest" pixel value and add the
+                        // "newest" pixel value.
+                        //
+                        // The sum is u32 so that it can fit MAXIMUM_KERNEL_SIZE * 255.
+                        let mut sum_r = 0;
+                        let mut sum_g = 0;
+                        let mut sum_b = 0;
+                        let mut sum_a = 0;
+
+                        // The whole sum needs to be computed for the first pixel. However, we know
+                        // that values outside of bounds are transparent, so the loop starts on the
+                        // first pixel in bounds.
+                        for j in main_axis_min..min(main_axis_max, main_axis_min + shift) {
+                            let Pixel { r, g, b, a } = pixel(i, j);
+
+                            if !A::IS_ALPHA_ONLY {
+                                sum_r += u32::from(r);
+                                sum_g += u32::from(g);
+                                sum_b += u32::from(b);
+                            }
+
+                            sum_a += u32::from(a);
+                        }
+
+                        set_pixel(
+                            main_axis_min as u32,
+                            Pixel {
+                                r: compute(sum_r),
+                                g: compute(sum_g),
+                                b: compute(sum_b),
+                                a: compute(sum_a),
+                            },
+                        );
+
+                        // Now, go through all the other pixels.
+                        //
+                        // j - target - 1 >= main_axis_min
+                        // j >= main_axis_min + target + 1
+                        let start_subtracting_at = main_axis_min + target + 1;
+
+                        // j + shift - 1 < main_axis_max
+                        // j < main_axis_max - shift + 1
+                        let stop_adding_at = main_axis_max - shift + 1;
+
+                        for j in main_axis_min + 1..main_axis_max {
+                            if j >= start_subtracting_at {
+                                let old_pixel = pixel(i, j - target - 1);
+
+                                if !A::IS_ALPHA_ONLY {
+                                    sum_r -= u32::from(old_pixel.r);
+                                    sum_g -= u32::from(old_pixel.g);
+                                    sum_b -= u32::from(old_pixel.b);
+                                }
+
+                                sum_a -= u32::from(old_pixel.a);
+                            }
+
+                            if j < stop_adding_at {
+                                let new_pixel = pixel(i, j + shift - 1);
+
+                                if !A::IS_ALPHA_ONLY {
+                                    sum_r += u32::from(new_pixel.r);
+                                    sum_g += u32::from(new_pixel.g);
+                                    sum_b += u32::from(new_pixel.b);
+                                }
+
+                                sum_a += u32::from(new_pixel.a);
+                            }
+
+                            set_pixel(
+                                j as u32,
+                                Pixel {
+                                    r: compute(sum_r),
+                                    g: compute(sum_g),
+                                    b: compute(sum_b),
+                                    a: compute(sum_a),
+                                },
+                            );
+                        }
+                    });
                 }
-
-                set_pixel(
-                    i as u32,
-                    main_axis_min as u32,
-                    Pixel {
-                        r: compute(sum_r),
-                        g: compute(sum_g),
-                        b: compute(sum_b),
-                        a: compute(sum_a),
-                    },
-                );
-
-                // Now, go through all the other pixels.
-                for j in main_axis_min + 1..main_axis_max {
-                    let old_pixel = pixel(i, j - target - 1);
-
-                    if !self.is_alpha_only() {
-                        sum_r -= u32::from(old_pixel.r);
-                        sum_g -= u32::from(old_pixel.g);
-                        sum_b -= u32::from(old_pixel.b);
-                    }
-
-                    sum_a -= u32::from(old_pixel.a);
-
-                    let new_pixel = pixel(i, j + shift - 1);
-
-                    if !self.is_alpha_only() {
-                        sum_r += u32::from(new_pixel.r);
-                        sum_g += u32::from(new_pixel.g);
-                        sum_b += u32::from(new_pixel.b);
-                    }
-
-                    sum_a += u32::from(new_pixel.a);
-
-                    set_pixel(
-                        i as u32,
-                        j as u32,
-                        Pixel {
-                            r: compute(sum_r),
-                            g: compute(sum_g),
-                            b: compute(sum_b),
-                            a: compute(sum_a),
-                        },
-                    );
-                }
-            }
+            });
         }
+
+        // Don't forget to manually mark the surface as dirty (due to usage of
+        // `UnsafeSendPixelData`).
+        unsafe { cairo_sys::cairo_surface_mark_dirty(output_surface.to_raw_none()) }
     }
 
     /// Performs a horizontal or vertical box blur.
@@ -574,17 +768,20 @@ impl SharedImageSurface {
     /// # Panics
     /// Panics if `kernel_size` is `0` or if `target >= kernel_size`.
     #[inline]
-    pub fn box_blur(
+    pub fn box_blur<B: BlurDirection>(
         &self,
         bounds: IRect,
         kernel_size: usize,
         target: usize,
-        vertical: bool,
     ) -> Result<SharedImageSurface, cairo::Status> {
         let mut output_surface =
             cairo::ImageSurface::create(cairo::Format::ARgb32, self.width, self.height)?;
 
-        self.box_blur_loop(&mut output_surface, bounds, kernel_size, target, vertical);
+        if self.is_alpha_only() {
+            self.box_blur_loop::<B, AlphaOnly>(&mut output_surface, bounds, kernel_size, target);
+        } else {
+            self.box_blur_loop::<B, NotAlphaOnly>(&mut output_surface, bounds, kernel_size, target);
+        }
 
         SharedImageSurface::new(output_surface, self.surface_type)
     }
@@ -594,7 +791,7 @@ impl SharedImageSurface {
     /// # Safety
     /// The returned pointer must not be used to modify the surface.
     #[inline]
-    pub unsafe fn to_glib_none(&self) -> Stash<*mut cairo_sys::cairo_surface_t, ImageSurface> {
+    pub unsafe fn to_glib_none(&self) -> Stash<'_, *mut cairo_sys::cairo_surface_t, ImageSurface> {
         self.surface.to_glib_none()
     }
 }

@@ -9,12 +9,13 @@ use pango_cairo_sys;
 use pango_sys;
 use pangocairo;
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use bbox::BoundingBox;
 use clip_path::{ClipPathUnits, NodeClipPath};
 use coord_units::CoordUnits;
-use defs::{self, RsvgDefs};
+use defs::{Defs, RsvgDefs};
+use error::RenderingError;
 use filters;
 use float_eq_cairo::ApproxEqCairo;
 use length::Dasharray;
@@ -34,15 +35,85 @@ use state::{
     StrokeLinejoin,
     TextRendering,
 };
+use tree::{RsvgTree, Tree};
 use unitinterval::UnitInterval;
 use viewbox::ViewBox;
 
+/// Holds values that are required to normalize `Length` values to a current viewport.
+///
+/// This struct is created by calling `DrawingCtx::push_view_box()` or
+/// `DrawingCtx::get_view_params()`.
+///
+/// This struct holds the size of the current viewport in the user's coordinate system.  A
+/// viewport pushed with `DrawingCtx::push_view_box()` will remain in place until the
+/// returned `ViewParams` is dropped; at that point, the `DrawingCtx` will resume using its
+/// previous viewport.
+pub struct ViewParams {
+    dpi_x: f64,
+    dpi_y: f64,
+    view_box_width: f64,
+    view_box_height: f64,
+    view_box_stack: Option<Weak<RefCell<Vec<ViewBox>>>>,
+}
+
+impl ViewParams {
+    #[cfg(test)]
+    pub fn new(dpi_x: f64, dpi_y: f64, view_box_width: f64, view_box_height: f64) -> ViewParams {
+        ViewParams {
+            dpi_x,
+            dpi_y,
+            view_box_width,
+            view_box_height,
+            view_box_stack: None,
+        }
+    }
+
+    pub fn dpi_x(&self) -> f64 {
+        self.dpi_x
+    }
+
+    pub fn dpi_y(&self) -> f64 {
+        self.dpi_y
+    }
+
+    pub fn view_box_width(&self) -> f64 {
+        self.view_box_width
+    }
+
+    pub fn view_box_height(&self) -> f64 {
+        self.view_box_height
+    }
+}
+
+impl Drop for ViewParams {
+    fn drop(&mut self) {
+        if let Some(ref weak_stack) = self.view_box_stack {
+            let stack = weak_stack
+                .upgrade()
+                .expect("A ViewParams was dropped after its DrawingCtx!?");
+            stack.borrow_mut().pop();
+        }
+    }
+}
+
 pub enum RsvgDrawingCtx {}
 
-pub struct DrawingCtx {
+pub struct DrawingCtx<'a> {
     rect: cairo::Rectangle,
     dpi_x: f64,
     dpi_y: f64,
+
+    /// This is a mitigation for the security-related bug
+    /// https://gitlab.gnome.org/GNOME/librsvg/issues/323 - imagine
+    /// the XML [billion laughs attack], but done by creating deeply
+    /// nested groups of `<use>` elements.  The first one references
+    /// the second one ten times, the second one references the third
+    /// one ten times, and so on.  In the file given, this causes
+    /// 10^17 objects to be rendered.  While this does not exhaust
+    /// memory, it would take a really long time.
+    ///
+    /// [billion laughs attack]: https://bitbucket.org/tiran/defusedxml
+    num_elements_rendered_through_use: usize,
 
     cr_stack: Vec<cairo::Context>,
     cr: cairo::Context,
@@ -50,21 +121,20 @@ pub struct DrawingCtx {
 
     surfaces_stack: Vec<cairo::ImageSurface>,
 
-    vb: ViewBox,
-    vb_stack: Vec<ViewBox>,
+    view_box_stack: Rc<RefCell<Vec<ViewBox>>>,
 
     bbox: BoundingBox,
     bbox_stack: Vec<BoundingBox>,
 
     drawsub_stack: Vec<RsvgNode>,
 
-    defs: *const RsvgDefs,
-    acquired_nodes: RefCell<Vec<RsvgNode>>,
+    defs: RefCell<&'a mut Defs>,
+    acquired_nodes: Rc<RefCell<Vec<RsvgNode>>>,
 
     is_testing: bool,
 }
 
-impl<'a> DrawingCtx {
+impl<'a> DrawingCtx<'a> {
     pub fn new(
         cr: cairo::Context,
         width: f64,
@@ -73,9 +143,9 @@ impl<'a> DrawingCtx {
         vb_height: f64,
         dpi_x: f64,
         dpi_y: f64,
-        defs: *const RsvgDefs,
+        defs: &mut Defs,
         is_testing: bool,
-    ) -> DrawingCtx {
+    ) -> DrawingCtx<'_> {
         let mut affine = cr.get_matrix();
         let rect = cairo::Rectangle {
             x: 0.0,
@@ -83,7 +153,7 @@ impl<'a> DrawingCtx {
             width,
             height,
         }.transform(&affine)
-            .outer();
+        .outer();
 
         // scale according to size set by size_func callback
         let mut scale = cairo::Matrix::identity();
@@ -96,21 +166,24 @@ impl<'a> DrawingCtx {
         affine.y0 -= rect.y;
         cr.set_matrix(affine);
 
+        let mut view_box_stack = Vec::new();
+        view_box_stack.push(ViewBox::new(0.0, 0.0, vb_width, vb_height));
+
         DrawingCtx {
             rect,
             dpi_x,
             dpi_y,
+            num_elements_rendered_through_use: 0,
             cr_stack: Vec::new(),
             cr: cr.clone(),
             initial_cr: cr.clone(),
             surfaces_stack: Vec::new(),
-            vb: ViewBox::new(0.0, 0.0, vb_width, vb_height),
-            vb_stack: Vec::new(),
+            view_box_stack: Rc::new(RefCell::new(view_box_stack)),
             bbox: BoundingBox::new(&affine),
             bbox_stack: Vec::new(),
             drawsub_stack: Vec::new(),
-            defs,
-            acquired_nodes: RefCell::new(Vec::new()),
+            defs: RefCell::new(defs),
+            acquired_nodes: Rc::new(RefCell::new(Vec::new())),
             is_testing,
         }
     }
@@ -156,21 +229,40 @@ impl<'a> DrawingCtx {
         }
     }
 
-    pub fn get_dpi(&self) -> (f64, f64) {
-        (self.dpi_x, self.dpi_y)
+    /// Gets the viewport that was last pushed with `push_view_box()`.
+    pub fn get_view_params(&self) -> ViewParams {
+        let view_box_stack = self.view_box_stack.borrow();
+        let last = view_box_stack.len() - 1;
+        let stack_top = &view_box_stack[last];
+
+        ViewParams {
+            dpi_x: self.dpi_x,
+            dpi_y: self.dpi_y,
+            view_box_width: stack_top.0.width,
+            view_box_height: stack_top.0.height,
+            view_box_stack: None,
+        }
     }
 
-    pub fn get_view_box_size(&self) -> (f64, f64) {
-        (self.vb.0.width, self.vb.0.height)
-    }
+    /// Pushes a viewport size for normalizing `Length` values.
+    ///
+    /// You should pass the returned `ViewParams` to all subsequent `Length.normalize()`
+    /// calls that correspond to this viewport.
+    ///
+    /// The viewport will stay in place, and will be the one returned by
+    /// `get_view_params()`, until the returned `ViewParams` is dropped.
+    pub fn push_view_box(&self, width: f64, height: f64) -> ViewParams {
+        self.view_box_stack
+            .borrow_mut()
+            .push(ViewBox::new(0.0, 0.0, width, height));
 
-    pub fn push_view_box(&mut self, width: f64, height: f64) {
-        self.vb_stack.push(self.vb);
-        self.vb = ViewBox::new(0.0, 0.0, width, height);
-    }
-
-    pub fn pop_view_box(&mut self) {
-        self.vb = self.vb_stack.pop().unwrap();
+        ViewParams {
+            dpi_x: self.dpi_x,
+            dpi_y: self.dpi_y,
+            view_box_width: width,
+            view_box_height: height,
+            view_box_stack: Some(Rc::downgrade(&self.view_box_stack)),
+        }
     }
 
     pub fn insert_bbox(&mut self, bbox: &BoundingBox) {
@@ -195,10 +287,11 @@ impl<'a> DrawingCtx {
     // acquire it again.  If you acquire a node "#foo" and don't release it before
     // trying to acquire "foo" again, you will obtain a %NULL the second time.
     pub fn get_acquired_node(&mut self, url: &str) -> Option<AcquiredNode> {
-        if let Some(node) = defs::lookup(self.defs, url) {
+        if let Some(node) = self.defs.borrow_mut().lookup(url) {
             if !self.acquired_nodes_contains(node) {
                 self.acquired_nodes.borrow_mut().push(node.clone());
-                return Some(AcquiredNode(&self.acquired_nodes as *const _, node.clone()));
+                let acq = AcquiredNode(self.acquired_nodes.clone(), node.clone());
+                return Some(acq);
             }
         }
 
@@ -225,6 +318,8 @@ impl<'a> DrawingCtx {
     // trying to acquire "foo" again, you will obtain a None the second time.
     //
     // For convenience, this function will return None if url is None.
+
+    // FIXME: return a Result<AcquiredNode, RenderingError::InvalidReference>
     pub fn get_acquired_node_of_type(
         &mut self,
         url: Option<&str>,
@@ -245,10 +340,10 @@ impl<'a> DrawingCtx {
         node: &RsvgNode,
         values: &ComputedValues,
         clipping: bool,
-        draw_fn: &mut FnMut(&mut DrawingCtx),
-    ) {
+        draw_fn: &mut FnMut(&mut DrawingCtx<'_>) -> Result<(), RenderingError>,
+    ) -> Result<(), RenderingError> {
         if clipping {
-            draw_fn(self);
+            draw_fn(self)
         } else {
             let original_cr = self.cr.clone();
             original_cr.save();
@@ -269,28 +364,28 @@ impl<'a> DrawingCtx {
 
             let affine = original_cr.get_matrix();
 
-            let (clip_node, clip_units) = {
-                let clip_node = self
-                    .get_acquired_node_of_type(clip_uri, NodeType::ClipPath)
-                    .and_then(|acquired| Some(acquired.get()));
+            let (acquired_clip, clip_units) = {
+                if let Some(acquired) = self.get_acquired_node_of_type(clip_uri, NodeType::ClipPath)
+                {
+                    let ClipPathUnits(units) = acquired
+                        .get()
+                        .with_impl(|clip_path: &NodeClipPath| clip_path.get_units());
 
-                let mut clip_units = Default::default();
-
-                if let Some(ref clip_node) = clip_node {
-                    clip_node.with_impl(|clip_path: &NodeClipPath| {
-                        let ClipPathUnits(u) = clip_path.get_units();
-                        clip_units = Some(u);
-                    });
+                    (Some(acquired), Some(units))
+                } else {
+                    (None, None)
                 }
-
-                (clip_node, clip_units)
             };
 
             if clip_units == Some(CoordUnits::UserSpaceOnUse) {
-                if let Some(ref clip_node) = clip_node {
-                    clip_node.with_impl(|clip_path: &NodeClipPath| {
-                        clip_path.to_cairo_context(clip_node, &affine, self);
-                    });
+                let clip_node = acquired_clip.as_ref().unwrap().get();
+                let res = clip_node.with_impl(|clip_path: &NodeClipPath| {
+                    clip_path.to_cairo_context(clip_node, &affine, self)
+                });
+
+                if let Err(e) = res {
+                    original_cr.restore();
+                    return Err(e);
                 }
             }
 
@@ -301,73 +396,37 @@ impl<'a> DrawingCtx {
                 && comp_op == CompOp::SrcOver
                 && enable_background == EnableBackground::Accumulate);
 
-            let child_surface = {
-                if needs_temporary_surface {
-                    // FIXME: in the following, we unwrap() the result of
-                    // ImageSurface::create().  We have to decide how to handle
-                    // out-of-memory here.
-                    let surface = cairo::ImageSurface::create(
-                        cairo::Format::ARgb32,
-                        self.rect.width as i32,
-                        self.rect.height as i32,
-                    ).unwrap();
+            if needs_temporary_surface {
+                let surface = cairo::ImageSurface::create(
+                    cairo::Format::ARgb32,
+                    self.rect.width as i32,
+                    self.rect.height as i32,
+                )?;
 
-                    if filter.is_some() {
-                        self.surfaces_stack.push(surface.clone());
-                    }
-
-                    let cr = cairo::Context::new(&surface);
-                    cr.set_matrix(affine);
-
-                    self.cr_stack.push(self.cr.clone());
-                    self.cr = cr.clone();
-
-                    self.bbox_stack.push(self.bbox);
-                    self.bbox = BoundingBox::new(&affine);
-
-                    surface
-                } else {
-                    cairo::ImageSurface::from(original_cr.get_target()).unwrap()
+                if filter.is_some() {
+                    self.surfaces_stack.push(surface.clone());
                 }
-            };
 
-            draw_fn(self);
+                let cr = cairo::Context::new(&surface);
+                cr.set_matrix(affine);
+
+                self.cr_stack.push(self.cr.clone());
+                self.cr = cr.clone();
+
+                self.bbox_stack.push(self.bbox);
+                self.bbox = BoundingBox::new(&affine);
+            }
+
+            let mut res = draw_fn(self);
 
             if needs_temporary_surface {
-                let filter_result_surface = filter
-                    .and_then(|_| {
-                        // About the following unwrap(), see the FIXME above.  We should be pushing
-                        // only surfaces that are not in an error state, but currently we don't
-                        // actually ensure that.
-                        let output = self.surfaces_stack.pop().unwrap();
+                let child_surface = cairo::ImageSurface::from(self.cr.get_target()).unwrap();
 
-                        match self.get_acquired_node_of_type(filter, NodeType::Filter) {
-                            Some(acquired) => {
-                                let filter_node = acquired.get();
-
-                                if !filter_node.is_in_error() {
-                                    // FIXME: deal with out of memory here
-                                    Some(filters::render(&filter_node, node, &output, self))
-                                } else {
-                                    None
-                                }
-                            }
-                            None => {
-                                // Non-existing filters must act as null filters (that is, an
-                                // empty surface is returned).
-                                // TODO: handle the error properly and not via expect().
-                                Some(
-                                    cairo::ImageSurface::create(
-                                        cairo::Format::ARgb32,
-                                        child_surface.get_width(),
-                                        child_surface.get_height(),
-                                    ).expect("couldn't create an empty surface"),
-                                )
-                            }
-                        }
-                    })
-                    .or(Some(child_surface))
-                    .unwrap();
+                let filter_result_surface = if let Some(filter_uri) = filter {
+                    self.run_filter(filter_uri, values, &child_surface)?
+                } else {
+                    child_surface
+                };
 
                 self.cr = self.cr_stack.pop().unwrap();
 
@@ -377,10 +436,14 @@ impl<'a> DrawingCtx {
                 original_cr.set_source_surface(&filter_result_surface, xofs, yofs);
 
                 if clip_units == Some(CoordUnits::ObjectBoundingBox) {
-                    if let Some(ref clip_node) = clip_node {
-                        clip_node.with_impl(|clip_path: &NodeClipPath| {
-                            clip_path.to_cairo_context(clip_node, &affine, self);
-                        });
+                    let clip_node = acquired_clip.as_ref().unwrap().get();
+                    let res = clip_node.with_impl(|clip_path: &NodeClipPath| {
+                        clip_path.to_cairo_context(clip_node, &affine, self)
+                    });
+
+                    if let Err(e) = res {
+                        original_cr.restore();
+                        return Err(e);
                     }
                 }
 
@@ -392,8 +455,10 @@ impl<'a> DrawingCtx {
                     {
                         let node = acquired.get();
 
-                        node.with_impl(|mask: &NodeMask| {
-                            mask.generate_cairo_mask(&node, &affine, self);
+                        res = res.and_then(|_| {
+                            node.with_impl(|mask: &NodeMask| {
+                                mask.generate_cairo_mask(&node, &affine, self)
+                            })
                         });
                     }
                 } else if opacity < 1.0 {
@@ -408,6 +473,40 @@ impl<'a> DrawingCtx {
             }
 
             original_cr.restore();
+
+            res
+        }
+    }
+
+    fn run_filter(
+        &mut self,
+        filter_uri: &str,
+        values: &ComputedValues,
+        child_surface: &cairo::ImageSurface,
+    ) -> Result<cairo::ImageSurface, RenderingError> {
+        let output = self.surfaces_stack.pop().unwrap();
+
+        match self.get_acquired_node_of_type(Some(filter_uri), NodeType::Filter) {
+            Some(acquired) => {
+                let filter_node = acquired.get();
+
+                if !filter_node.is_in_error() {
+                    // FIXME: deal with out of memory here
+                    Ok(filters::render(&filter_node, values, &output, self))
+                } else {
+                    Ok(child_surface.clone())
+                }
+            }
+
+            None => {
+                // Non-existing filters must act as null filters (that is, an
+                // empty surface is returned).
+                Ok(cairo::ImageSurface::create(
+                    cairo::Format::ARgb32,
+                    child_surface.get_width(),
+                    child_surface.get_height(),
+                )?)
+            }
         }
     }
 
@@ -439,11 +538,11 @@ impl<'a> DrawingCtx {
         x: f64,
         y: f64,
         clipping: bool,
-    ) {
+    ) -> Result<(), RenderingError> {
         let (ink, _) = layout.get_extents();
 
         if ink.width == 0 || ink.height == 0 {
-            return;
+            return Ok(());
         }
 
         let cr = self.get_cairo_context();
@@ -475,63 +574,83 @@ impl<'a> DrawingCtx {
 
         let fill_opacity = &values.fill_opacity.0;
 
-        if !clipping {
-            if paint_server::set_source_paint_server(
+        let res = if !clipping {
+            paint_server::set_source_paint_server(
                 self,
                 &values.fill.0,
                 fill_opacity,
                 &bbox,
                 current_color,
-            ) {
-                pangocairo::functions::update_layout(&cr, layout);
-                pangocairo::functions::show_layout(&cr, layout);
-            }
-        }
+            ).and_then(|had_paint_server| {
+                if had_paint_server {
+                    pangocairo::functions::update_layout(&cr, layout);
+                    pangocairo::functions::show_layout(&cr, layout);
+                };
+                Ok(())
+            })
+        } else {
+            Ok(())
+        };
 
-        let stroke_opacity = &values.stroke_opacity.0;
+        if res.is_ok() {
+            let stroke_opacity = &values.stroke_opacity.0;
 
-        let mut need_layout_path = clipping;
+            let mut need_layout_path = clipping;
 
-        if !clipping {
-            if paint_server::set_source_paint_server(
-                self,
-                &values.stroke.0,
-                stroke_opacity,
-                &bbox,
-                &current_color,
-            ) {
-                need_layout_path = true;
-            }
-        }
+            let res = if !clipping {
+                paint_server::set_source_paint_server(
+                    self,
+                    &values.stroke.0,
+                    stroke_opacity,
+                    &bbox,
+                    &current_color,
+                ).and_then(|had_paint_server| {
+                    if had_paint_server {
+                        need_layout_path = true;
+                    }
+                    Ok(())
+                })
+            } else {
+                Ok(())
+            };
 
-        if need_layout_path {
-            pangocairo::functions::update_layout(&cr, layout);
-            pangocairo::functions::layout_path(&cr, layout);
+            if res.is_ok() {
+                if need_layout_path {
+                    pangocairo::functions::update_layout(&cr, layout);
+                    pangocairo::functions::layout_path(&cr, layout);
 
-            if !clipping {
-                let ib = BoundingBox::new(&affine).with_ink_extents(cr.stroke_extents());
-                cr.stroke();
-                self.insert_bbox(&ib);
+                    if !clipping {
+                        let ib = BoundingBox::new(&affine).with_ink_extents(cr.stroke_extents());
+                        cr.stroke();
+                        self.insert_bbox(&ib);
+                    }
+                }
             }
         }
 
         cr.restore();
+
+        res
     }
 
     fn setup_cr_for_stroke(&self, cr: &cairo::Context, values: &ComputedValues) {
-        cr.set_line_width(values.stroke_width.0.normalize(values, self));
+        let params = self.get_view_params();
+
+        cr.set_line_width(values.stroke_width.0.normalize(values, &params));
         cr.set_miter_limit(values.stroke_miterlimit.0);
         cr.set_line_cap(cairo::LineCap::from(values.stroke_line_cap));
         cr.set_line_join(cairo::LineJoin::from(values.stroke_line_join));
 
         if let StrokeDasharray(Dasharray::Array(ref dashes)) = values.stroke_dasharray {
-            let normalized_dashes: Vec<f64> =
-                dashes.iter().map(|l| l.normalize(values, self)).collect();
+            let normalized_dashes: Vec<f64> = dashes
+                .iter()
+                .map(|l| l.normalize(values, &params))
+                .collect();
 
             let total_length = normalized_dashes.iter().fold(0.0, |acc, &len| acc + len);
 
             if total_length > 0.0 {
-                let offset = values.stroke_dashoffset.0.normalize(values, self);
+                let offset = values.stroke_dashoffset.0.normalize(values, &params);
                 cr.set_dash(&normalized_dashes, offset);
             } else {
                 cr.set_dash(&[], 0.0);
@@ -539,7 +658,11 @@ impl<'a> DrawingCtx {
         }
     }
 
-    pub fn stroke_and_fill(&mut self, cr: &cairo::Context, values: &ComputedValues) {
+    pub fn stroke_and_fill(
+        &mut self,
+        cr: &cairo::Context,
+        values: &ComputedValues,
+    ) -> Result<(), RenderingError> {
         cr.set_antialias(cairo::Antialias::from(values.shape_rendering));
 
         self.setup_cr_for_stroke(cr, values);
@@ -555,35 +678,44 @@ impl<'a> DrawingCtx {
 
         let fill_opacity = &values.fill_opacity.0;
 
-        if paint_server::set_source_paint_server(
+        let res = paint_server::set_source_paint_server(
             self,
             &values.fill.0,
             fill_opacity,
             &bbox,
             current_color,
-        ) {
-            if values.stroke.0 == PaintServer::None {
-                cr.fill();
-            } else {
-                cr.fill_preserve();
+        ).and_then(|had_paint_server| {
+            if had_paint_server {
+                if values.stroke.0 == PaintServer::None {
+                    cr.fill();
+                } else {
+                    cr.fill_preserve();
+                }
             }
-        }
 
-        let stroke_opacity = values.stroke_opacity.0;
+            Ok(())
+        }).and_then(|_| {
+            let stroke_opacity = values.stroke_opacity.0;
 
-        if paint_server::set_source_paint_server(
-            self,
-            &values.stroke.0,
-            &stroke_opacity,
-            &bbox,
-            &current_color,
-        ) {
-            cr.stroke();
-        }
+            paint_server::set_source_paint_server(
+                self,
+                &values.stroke.0,
+                &stroke_opacity,
+                &bbox,
+                &current_color,
+            ).and_then(|had_paint_server| {
+                if had_paint_server {
+                    cr.stroke();
+                }
+                Ok(())
+            })
+        });
 
         // clear the path in case stroke == fill == None; otherwise
         // we leave it around from computing the bounding box
         cr.new_path();
+
+        res
     }
 
     pub fn set_affine_on_cr(&self, cr: &cairo::Context) {
@@ -614,11 +746,11 @@ impl<'a> DrawingCtx {
     pub fn draw_node_on_surface(
         &mut self,
         node: &RsvgNode,
-        cascaded: &CascadedValues,
+        cascaded: &CascadedValues<'_>,
         surface: &cairo::ImageSurface,
         width: f64,
         height: f64,
-    ) {
+    ) -> Result<(), RenderingError> {
         let save_cr = self.cr.clone();
         let save_initial_cr = self.initial_cr.clone();
         let save_rect = self.rect;
@@ -634,20 +766,23 @@ impl<'a> DrawingCtx {
         self.rect.width = width;
         self.rect.height = height;
 
-        self.draw_node_from_stack(cascaded, node, false);
+        let res = self.draw_node_from_stack(cascaded, node, false);
 
         self.cr = save_cr;
         self.initial_cr = save_initial_cr;
         self.rect = save_rect;
+
+        res
     }
 
     pub fn draw_node_from_stack(
         &mut self,
-        cascaded: &CascadedValues,
+        cascaded: &CascadedValues<'_>,
         node: &RsvgNode,
         clipping: bool,
-    ) {
+    ) -> Result<(), RenderingError> {
         let mut draw = true;
+        let mut res = Ok(());
 
         let stack_top = self.drawsub_stack.pop();
 
@@ -660,19 +795,37 @@ impl<'a> DrawingCtx {
         if draw {
             let values = cascaded.get();
             if values.is_visible() {
-                node.draw(node, cascaded, self, clipping);
+                res = node.draw(node, cascaded, self, clipping);
             }
         }
 
         if let Some(top) = stack_top {
             self.drawsub_stack.push(top);
         }
+
+        if res.is_ok() {
+            res = self.check_limits();
+        }
+
+        res
     }
 
     pub fn add_node_and_ancestors_to_stack(&mut self, node: &RsvgNode) {
         self.drawsub_stack.push(node.clone());
         if let Some(ref parent) = node.get_parent() {
             self.add_node_and_ancestors_to_stack(parent);
+        }
+    }
+
+    pub fn increase_num_elements_rendered_through_use(&mut self, n: usize) {
+        self.num_elements_rendered_through_use += n;
+    }
+
+    fn check_limits(&self) -> Result<(), RenderingError> {
+        if self.num_elements_rendered_through_use > 500_000 {
+            Err(RenderingError::InstancingLimit)
+        } else {
+            Ok(())
         }
     }
 }
@@ -883,34 +1036,25 @@ impl From<TextRendering> for cairo::Antialias {
 #[no_mangle]
 pub extern "C" fn rsvg_drawing_ctx_draw_node_from_stack(
     raw_draw_ctx: *mut RsvgDrawingCtx,
-    raw_node: *const RsvgNode,
-    raw_cascade_from: *const RsvgNode,
-    clipping: glib_sys::gboolean,
-) {
+    raw_tree: *const RsvgTree,
+) -> glib_sys::gboolean {
     assert!(!raw_draw_ctx.is_null());
-    let draw_ctx = unsafe { &mut *(raw_draw_ctx as *mut DrawingCtx) };
+    let draw_ctx = unsafe { &mut *(raw_draw_ctx as *mut DrawingCtx<'_>) };
 
-    assert!(!raw_node.is_null());
-    let node = unsafe { &*raw_node };
+    assert!(!raw_tree.is_null());
+    let tree = unsafe { &*(raw_tree as *const Tree) };
 
-    let cascade_from = if raw_cascade_from.is_null() {
-        None
+    // FIXME: The public API doesn't let us return a GError from the rendering
+    // functions, just a boolean.  Add a proper API to return proper errors from
+    // the rendering path.
+    if draw_ctx
+        .draw_node_from_stack(&tree.root.get_cascaded_values(), &tree.root, false)
+        .is_ok()
+    {
+        true.to_glib()
     } else {
-        Some(unsafe { &*raw_cascade_from })
-    };
-
-    let clipping: bool = from_glib(clipping);
-
-    let cascaded = match cascade_from {
-        None => node.get_cascaded_values(),
-        Some(n) => {
-            let c = n.get_cascaded_values();
-            let v = c.get();
-            CascadedValues::new_from_values(node, v)
-        }
-    };
-
-    draw_ctx.draw_node_from_stack(&cascaded, node, clipping);
+        false.to_glib()
+    }
 }
 
 #[no_mangle]
@@ -919,7 +1063,7 @@ pub extern "C" fn rsvg_drawing_ctx_add_node_and_ancestors_to_stack(
     raw_node: *const RsvgNode,
 ) {
     assert!(!raw_draw_ctx.is_null());
-    let draw_ctx = unsafe { &mut *(raw_draw_ctx as *mut DrawingCtx) };
+    let draw_ctx = unsafe { &mut *(raw_draw_ctx as *mut DrawingCtx<'_>) };
 
     assert!(!raw_node.is_null());
     let node = unsafe { &*raw_node };
@@ -931,36 +1075,60 @@ pub extern "C" fn rsvg_drawing_ctx_add_node_and_ancestors_to_stack(
 pub extern "C" fn rsvg_drawing_ctx_get_ink_rect(
     raw_draw_ctx: *const RsvgDrawingCtx,
     ink_rect: *mut cairo_sys::cairo_rectangle_t,
-) {
+) -> glib_sys::gboolean {
     assert!(!raw_draw_ctx.is_null());
-    let draw_ctx = unsafe { &mut *(raw_draw_ctx as *mut DrawingCtx) };
+    let draw_ctx = unsafe { &mut *(raw_draw_ctx as *mut DrawingCtx<'_>) };
 
     assert!(!ink_rect.is_null());
 
-    let r = draw_ctx.get_bbox().ink_rect.unwrap();
-    unsafe {
-        (*ink_rect).x = r.x;
-        (*ink_rect).y = r.y;
-        (*ink_rect).width = r.width;
-        (*ink_rect).height = r.height;
-    }
+    let res = match draw_ctx.get_bbox().ink_rect {
+        Some(r) => unsafe {
+            (*ink_rect).x = r.x;
+            (*ink_rect).y = r.y;
+            (*ink_rect).width = r.width;
+            (*ink_rect).height = r.height;
+            true
+        },
+        _ => false,
+    };
+
+    res.to_glib()
 }
 
-pub struct AcquiredNode(*const RefCell<Vec<RsvgNode>>, RsvgNode);
+pub struct AcquiredNode(Rc<RefCell<Vec<RsvgNode>>>, RsvgNode);
 
 impl Drop for AcquiredNode {
     fn drop(&mut self) {
-        unsafe {
-            let mut v = (*self.0).borrow_mut();
-            assert!(Rc::ptr_eq(v.last().unwrap(), &self.1));
-            v.pop();
-        }
+        let mut v = self.0.borrow_mut();
+        assert!(Rc::ptr_eq(v.last().unwrap(), &self.1));
+        v.pop();
     }
 }
 
 impl AcquiredNode {
-    pub fn get(&self) -> RsvgNode {
-        self.1.clone()
+    pub fn get(&self) -> &RsvgNode {
+        &self.1
+    }
+}
+
+/// Keeps a stack of nodes and can check if a certain node is contained in the stack
+///
+/// Sometimes parts of the code cannot plainly use the implicit stack of acquired
+/// nodes as maintained by DrawingCtx::get_acquired_node(), and they must keep their
+/// own stack of nodes to test for reference cycles.  NodeStack can be used to do that.
+pub struct NodeStack(Vec<RsvgNode>);
+
+impl NodeStack {
+    pub fn new() -> NodeStack {
+        NodeStack(Vec::new())
+    }
+
+    pub fn push(&mut self, node: &RsvgNode) {
+        self.0.push(node.clone());
+    }
+
+    pub fn contains(&self, node: &RsvgNode) -> bool {
+        self.0.iter().find(|n| Rc::ptr_eq(n, node)).is_some()
     }
 }
 
@@ -973,9 +1141,12 @@ pub extern "C" fn rsvg_drawing_ctx_new(
     vb_height: libc::c_double,
     dpi_x: libc::c_double,
     dpi_y: libc::c_double,
-    defs: *const RsvgDefs,
+    defs: *mut RsvgDefs,
     is_testing: glib_sys::gboolean,
 ) -> *mut RsvgDrawingCtx {
+    assert!(!defs.is_null());
+    let defs = unsafe { &mut *(defs as *mut Defs) };
+
     Box::into_raw(Box::new(DrawingCtx::new(
         unsafe { from_glib_none(cr) },
         f64::from(width),
@@ -992,7 +1163,7 @@ pub extern "C" fn rsvg_drawing_ctx_new(
 #[no_mangle]
 pub extern "C" fn rsvg_drawing_ctx_free(raw_draw_ctx: *mut RsvgDrawingCtx) {
     assert!(!raw_draw_ctx.is_null());
-    let draw_ctx = unsafe { &mut *(raw_draw_ctx as *mut DrawingCtx) };
+    let draw_ctx = unsafe { &mut *(raw_draw_ctx as *mut DrawingCtx<'_>) };
 
     unsafe {
         Box::from_raw(draw_ctx);

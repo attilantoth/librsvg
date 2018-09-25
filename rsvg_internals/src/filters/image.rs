@@ -11,6 +11,7 @@ use libc;
 use aspect_ratio::AspectRatio;
 use attributes::Attribute;
 use drawing_ctx::DrawingCtx;
+use error::RenderingError;
 use handle::RsvgHandle;
 use node::{CascadedValues, NodeResult, NodeTrait, RsvgNode};
 use parsers::parse;
@@ -49,7 +50,7 @@ impl Image {
     fn render_node(
         &self,
         ctx: &FilterContext,
-        draw_ctx: &mut DrawingCtx,
+        draw_ctx: &mut DrawingCtx<'_>,
         bounds: IRect,
         href: &str,
     ) -> Result<ImageSurface, FilterError> {
@@ -68,19 +69,26 @@ impl Image {
 
         draw_ctx.get_cairo_context().set_matrix(ctx.paffine());
 
-        let node_being_filtered = ctx.get_node_being_filtered();
-        let node_being_filtered_cascaded = node_being_filtered.get_cascaded_values();
-        let node_being_filtered_values = node_being_filtered_cascaded.get();
+        let node_being_filtered_values = ctx.get_computed_values_from_node_being_filtered();
 
         let cascaded = CascadedValues::new_from_values(&drawable, node_being_filtered_values);
 
-        draw_ctx.draw_node_on_surface(
-            &drawable,
-            &cascaded,
-            &surface,
-            f64::from(ctx.source_graphic().width()),
-            f64::from(ctx.source_graphic().height()),
-        );
+        draw_ctx
+            .draw_node_on_surface(
+                &drawable,
+                &cascaded,
+                &surface,
+                f64::from(ctx.source_graphic().width()),
+                f64::from(ctx.source_graphic().height()),
+            ).map_err(|e| {
+                if let RenderingError::Cairo(status) = e {
+                    FilterError::CairoError(status)
+                } else {
+                    // FIXME: this is just a dummy value; we should probably have a way to indicate
+                    // an error in the underlying drawing process.
+                    FilterError::CairoError(cairo::Status::InvalidStatus)
+                }
+            })?;
 
         // Clip the output to bounds.
         let output_surface = ImageSurface::create(
@@ -107,8 +115,8 @@ impl Image {
     fn render_external_image(
         &self,
         ctx: &FilterContext,
-        draw_ctx: &mut DrawingCtx,
-        bounds_builder: BoundsBuilder,
+        draw_ctx: &mut DrawingCtx<'_>,
+        bounds_builder: BoundsBuilder<'_>,
         href: &str,
     ) -> Result<ImageSurface, FilterError> {
         let surface = {
@@ -191,7 +199,7 @@ impl NodeTrait for Image {
         &self,
         node: &RsvgNode,
         handle: *const RsvgHandle,
-        pbag: &PropertyBag,
+        pbag: &PropertyBag<'_>,
     ) -> NodeResult {
         self.base.set_atts(node, handle, pbag)?;
 
@@ -220,7 +228,7 @@ impl Filter for Image {
         &self,
         _node: &RsvgNode,
         ctx: &FilterContext,
-        draw_ctx: &mut DrawingCtx,
+        draw_ctx: &mut DrawingCtx<'_>,
     ) -> Result<FilterResult, FilterError> {
         let href = self.href.borrow();
         let href = href.as_ref().ok_or(FilterError::InvalidInput)?;

@@ -13,6 +13,8 @@ variables:
   I386_UBUNTU_BIONIC:        "registry.gitlab.gnome.org/gnome/librsvg-oci-images/i386/ubuntu:18.04"
 
   RUSTC_1_26:                "registry.gitlab.gnome.org/gnome/librsvg-oci-images/rustc:1.26"
+  RUSTC_1_27:                "registry.gitlab.gnome.org/gnome/librsvg-oci-images/rustc:1.27"
+  RUSTC_1_28:                "registry.gitlab.gnome.org/gnome/librsvg-oci-images/rustc:1.28"
 
   RUSTFMT_NIGHTLY:           "registry.gitlab.com/alatiera/rustfmt-oci-image/rustfmt:nightly"
   CLIPPY_NIGHTLY:            "registry.gitlab.gnome.org/gnome/librsvg-oci-images/clippy:nightly"
@@ -38,14 +40,18 @@ stages:
     - export CARGO_HOME="${PWD}/.cargo_cache"
   script:
     - rustc --version && cargo --version
-    - ./autogen.sh --enable-gtk-doc --enable-vala
-    - make check
+    - |
+      mkdir -p _build
+      cd _build
+      ../autogen.sh --enable-gtk-doc --enable-vala
+      make
+      make check
 
   artifacts:
     when: on_failure
     paths:
-      - tests/*.log
-      - tests/output/
+      - _build/tests/*.log
+      - _build/tests/output/
 
   cache:
     # JOB_NAME - Each job will have it's own cache
@@ -53,7 +59,7 @@ stages:
     # ^ Keep diffrerent caches for each branch
     key: "$CI_JOB_NAME-$CI_COMMIT_REF_SLUG"
     paths:
-      - target/
+      - _build/target/
       - .cargo_cache/
       - ccache/
 
@@ -79,8 +85,10 @@ stages:
   only:
     # When branching a stable branch,
     # update the following line from master to branch's name.
+    - librsvg-2.44@GNOME/librsvg
     - librsvg-2.42@GNOME/librsvg
     - master@GNOME/librsvg
+    - librsvg-2.44
     - librsvg-2.42
     - schedules
     - tags
@@ -98,7 +106,7 @@ stages:
 # STAGE 1 TESTS
 ########################################################################
 
-fedora:test:
+fedora test:
   image: $AMD64_FEDORA_LATEST
   stage: test
   variables:
@@ -132,13 +140,16 @@ clippy:
 
 tarball:
   image: $AMD64_FEDORA_LATEST
-  stage: distcheck
+  stage: lint
   variables:
     LIBRSVG_DEBUG: "yes"
   script:
     - rustc --version && cargo --version
-    - ./autogen.sh --enable-gtk-doc --enable-vala
-    - make distcheck DESTDIR=/tmp/distcheck
+    - |
+      mkdir -p _build
+      cd _build
+      ../autogen.sh --enable-gtk-doc --enable-vala
+      make distcheck DESTDIR=/tmp/distcheck
   <<: *stage_2
 
 # STAGE 2 CROSS DISTRO TESTS
@@ -158,14 +169,14 @@ opensuse:tumbleweed:
   <<: *distro_test
   <<: *stage_2
 
-debian:testing:
+.debian:testing:
   image: $AMD64_DEBIAN_TESTING
   variables:
     LIBRSVG_DEBUG: "yes"
   <<: *distro_test
   <<: *stage_2
 
-debian_i386:testing:
+.debian_i386:testing:
   image: $I386_DEBIAN_TESTING
   variables:
     LIBRSVG_DEBUG: "yes"
@@ -183,7 +194,7 @@ fedora:test_release:
   <<: *distro_test
   <<: *stage_3
 
-debian:testing_release_i386:
+.debian:testing_release_i386:
   image: $I386_DEBIAN_TESTING
   variables:
     LIBRSVG_DEBUG: "no"
@@ -193,8 +204,22 @@ debian:testing_release_i386:
 # STAGE 3 RUSTC TESTS
 #######################################################################
 
-rustc:1_26:
+.rustc 1.26 1:
   image: $RUSTC_1_26
+  variables:
+    LIBRSVG_DEBUG: "yes"
+  <<: *rustc
+  <<: *stage_3
+
+.rustc 1.27 2:
+  image: $RUSTC_1_27
+  variables:
+    LIBRSVG_DEBUG: "yes"
+  <<: *rustc
+  <<: *stage_3
+
+.rustc 1.28 3:
+  image: $RUSTC_1_28
   variables:
     LIBRSVG_DEBUG: "yes"
   <<: *rustc

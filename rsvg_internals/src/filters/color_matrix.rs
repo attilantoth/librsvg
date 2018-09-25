@@ -52,7 +52,7 @@ impl NodeTrait for ColorMatrix {
         &self,
         node: &RsvgNode,
         handle: *const RsvgHandle,
-        pbag: &PropertyBag,
+        pbag: &PropertyBag<'_>,
     ) -> NodeResult {
         self.base.set_atts(node, handle, pbag)?;
 
@@ -107,7 +107,7 @@ impl NodeTrait for ColorMatrix {
                     }
                     OperationType::Saturate => {
                         let s = parsers::number(value)
-                            .map_err(|err| NodeError::parse_error(attr, err))?;
+                            .map_err(|err| NodeError::attribute_error(attr, err))?;
                         if s < 0.0 || s > 1.0 {
                             return Err(NodeError::value_error(attr, "expected value from 0 to 1"));
                         }
@@ -123,7 +123,7 @@ impl NodeTrait for ColorMatrix {
                     }
                     OperationType::HueRotate => {
                         let degrees = parsers::number(value)
-                            .map_err(|err| NodeError::parse_error(attr, err))?;
+                            .map_err(|err| NodeError::attribute_error(attr, err))?;
 
                         let (sin, cos) = degrees.to_radians().sin_cos();
 
@@ -170,7 +170,7 @@ impl Filter for ColorMatrix {
         &self,
         _node: &RsvgNode,
         ctx: &FilterContext,
-        draw_ctx: &mut DrawingCtx,
+        draw_ctx: &mut DrawingCtx<'_>,
     ) -> Result<FilterResult, FilterError> {
         let input = self.base.get_input(ctx, draw_ctx)?;
         let bounds = self
@@ -210,13 +210,13 @@ impl Filter for ColorMatrix {
 
                 let new_alpha = clamp(new_pixel_vec[3], 0.0, 1.0);
 
-                let premultiply = |x: f64| (clamp(x, 0.0, 1.0) * new_alpha * 255f64).round() as u8;
+                let premultiply = |x: f64| ((clamp(x, 0.0, 1.0) * new_alpha * 255f64) + 0.5) as u8;
 
                 let output_pixel = Pixel {
                     r: premultiply(new_pixel_vec[0]),
                     g: premultiply(new_pixel_vec[1]),
                     b: premultiply(new_pixel_vec[2]),
-                    a: (new_alpha * 255f64).round() as u8,
+                    a: ((new_alpha * 255f64) + 0.5) as u8,
                 };
 
                 output_data.set_pixel(output_stride, output_pixel, x, y);

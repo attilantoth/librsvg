@@ -20,8 +20,8 @@
 //! [`AspectRatio`]: struct.AspectRatio.html
 //! [spec]: https://www.w3.org/TR/SVG/coords.html#PreserveAspectRatioAttribute
 
-use cssparser::Parser;
-use error::*;
+use cssparser::{CowRcStr, Parser};
+use error::ValueErrorKind;
 use parsers::Parse;
 use parsers::ParseError;
 use std::ops::Deref;
@@ -150,75 +150,65 @@ impl AspectRatio {
             }
         }
     }
+}
 
-    fn parse_input<'i, 't>(p: &mut Parser<'i, 't>) -> Result<AspectRatio, ()> {
-        let defer = p.try(|p| p.expect_ident_matching("defer")).is_ok();
+fn parse_align_xy(ident: &CowRcStr) -> Result<Option<(X, Y)>, ValueErrorKind> {
+    use self::Align1D::*;
 
-        let align_xy = p.try(|p| {
-            p.expect_ident()
-                .map_err(|_| ())
-                .and_then(|ident| Align::parse_xy(ident))
-        })?;
+    match ident.as_ref() {
+        "none" => Ok(None),
 
-        let fit =
-            p.try(|p| {
-                p.expect_ident()
-                    .map_err(|_| ())
-                    .and_then(|ident| FitMode::parse(ident))
-            }).unwrap_or(FitMode::default());
+        "xMinYMin" => Ok(Some((X(Min), Y(Min)))),
+        "xMidYMin" => Ok(Some((X(Mid), Y(Min)))),
+        "xMaxYMin" => Ok(Some((X(Max), Y(Min)))),
 
-        p.expect_exhausted().map_err(|_| ())?;
+        "xMinYMid" => Ok(Some((X(Min), Y(Mid)))),
+        "xMidYMid" => Ok(Some((X(Mid), Y(Mid)))),
+        "xMaxYMid" => Ok(Some((X(Max), Y(Mid)))),
 
-        let align = align_xy.map(|(x, y)| Align { x, y, fit });
+        "xMinYMax" => Ok(Some((X(Min), Y(Max)))),
+        "xMidYMax" => Ok(Some((X(Mid), Y(Max)))),
+        "xMaxYMax" => Ok(Some((X(Max), Y(Max)))),
 
-        Ok(AspectRatio { defer, align })
+        _ => Err(ValueErrorKind::Parse(ParseError::new("invalid alignment"))),
     }
 }
 
-impl Align {
-    fn parse_xy(s: &str) -> Result<Option<(X, Y)>, ()> {
-        use self::Align1D::*;
-
-        match s {
-            "none" => Ok(None),
-
-            "xMinYMin" => Ok(Some((X(Min), Y(Min)))),
-            "xMidYMin" => Ok(Some((X(Mid), Y(Min)))),
-            "xMaxYMin" => Ok(Some((X(Max), Y(Min)))),
-
-            "xMinYMid" => Ok(Some((X(Min), Y(Mid)))),
-            "xMidYMid" => Ok(Some((X(Mid), Y(Mid)))),
-            "xMaxYMid" => Ok(Some((X(Max), Y(Mid)))),
-
-            "xMinYMax" => Ok(Some((X(Min), Y(Max)))),
-            "xMidYMax" => Ok(Some((X(Mid), Y(Max)))),
-            "xMaxYMax" => Ok(Some((X(Max), Y(Max)))),
-
-            _ => Err(()),
-        }
-    }
-}
-
-impl FitMode {
-    fn parse(s: &str) -> Result<FitMode, ()> {
-        match s {
-            "meet" => Ok(FitMode::Meet),
-            "slice" => Ok(FitMode::Slice),
-            _ => Err(()),
-        }
+fn parse_fit_mode(s: &str) -> Result<FitMode, ValueErrorKind> {
+    match s {
+        "meet" => Ok(FitMode::Meet),
+        "slice" => Ok(FitMode::Slice),
+        _ => Err(ValueErrorKind::Parse(ParseError::new("invalid fit mode"))),
     }
 }
 
 impl Parse for AspectRatio {
     type Data = ();
-    type Err = AttributeError;
+    type Err = ValueErrorKind;
 
-    fn parse(parser: &mut Parser, _: ()) -> Result<AspectRatio, AttributeError> {
-        AspectRatio::parse_input(parser).map_err(|_| {
-            AttributeError::Parse(ParseError::new(
-                "expected \"[defer] <align> [meet | slice]\"",
-            ))
-        })
+    fn parse(parser: &mut Parser<'_, '_>, _: ()) -> Result<AspectRatio, ValueErrorKind> {
+        let defer = parser.try(|p| p.expect_ident_matching("defer")).is_ok();
+
+        let align_xy = parser.try(|p| {
+            p.expect_ident()
+                .map_err(|_| ValueErrorKind::Parse(ParseError::new("expected identifier")))
+                .and_then(|ident| parse_align_xy(ident))
+        })?;
+
+        let fit = parser
+            .try(|p| {
+                p.expect_ident()
+                    .map_err(|_| ValueErrorKind::Parse(ParseError::new("expected identifier")))
+                    .and_then(|ident| parse_fit_mode(ident))
+            }).unwrap_or(FitMode::default());
+
+        parser
+            .expect_exhausted()
+            .map_err(|_| ValueErrorKind::Parse(ParseError::new("extra data in AspectRatio")))?;
+
+        let align = align_xy.map(|(x, y)| Align { x, y, fit });
+
+        Ok(AspectRatio { defer, align })
     }
 }
 

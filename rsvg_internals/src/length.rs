@@ -1,7 +1,7 @@
 use cssparser::{Parser, Token};
 use std::f64::consts::*;
 
-use drawing_ctx::DrawingCtx;
+use drawing_ctx::ViewParams;
 use error::*;
 use parsers::Parse;
 use parsers::ParseError;
@@ -40,7 +40,7 @@ impl Default for Length {
     }
 }
 
-const POINTS_PER_INCH: f64 = 72.0;
+pub const POINTS_PER_INCH: f64 = 72.0;
 const CM_PER_INCH: f64 = 2.54;
 const MM_PER_INCH: f64 = 25.4;
 const PICA_PER_INCH: f64 = 6.0;
@@ -55,8 +55,8 @@ const PICA_PER_INCH: f64 = 6.0;
 // inside Length::normalize(), when it needs to know to what the
 // length refers.
 
-fn make_err() -> AttributeError {
-    AttributeError::Parse(ParseError::new(
+fn make_err() -> ValueErrorKind {
+    ValueErrorKind::Parse(ParseError::new(
         "expected length: number(\"em\" | \"ex\" | \"px\" | \"in\" | \"cm\" | \"mm\" | \"pt\" | \
          \"pc\" | \"%\")?",
     ))
@@ -64,9 +64,9 @@ fn make_err() -> AttributeError {
 
 impl Parse for Length {
     type Data = LengthDir;
-    type Err = AttributeError;
+    type Err = ValueErrorKind;
 
-    fn parse(parser: &mut Parser, dir: LengthDir) -> Result<Length, AttributeError> {
+    fn parse(parser: &mut Parser<'_, '_>, dir: LengthDir) -> Result<Length, ValueErrorKind> {
         let length = Length::from_cssparser(parser, dir)?;
 
         parser.expect_exhausted().map_err(|_| make_err())?;
@@ -84,35 +84,34 @@ impl Length {
         }
     }
 
-    pub fn check_nonnegative(self) -> Result<Length, AttributeError> {
+    pub fn check_nonnegative(self) -> Result<Length, ValueErrorKind> {
         if self.length >= 0.0 {
             Ok(self)
         } else {
-            Err(AttributeError::Value(
+            Err(ValueErrorKind::Value(
                 "value must be non-negative".to_string(),
             ))
         }
     }
 
-    pub fn normalize(&self, values: &ComputedValues, draw_ctx: &DrawingCtx) -> f64 {
+    pub fn normalize(&self, values: &ComputedValues, params: &ViewParams) -> f64 {
         match self.unit {
             LengthUnit::Default => self.length,
 
-            LengthUnit::Percent => {
-                let (width, height) = draw_ctx.get_view_box_size();
-
-                match self.dir {
-                    LengthDir::Horizontal => self.length * width,
-                    LengthDir::Vertical => self.length * height,
-                    LengthDir::Both => self.length * viewport_percentage(width, height),
+            LengthUnit::Percent => match self.dir {
+                LengthDir::Horizontal => self.length * params.view_box_width(),
+                LengthDir::Vertical => self.length * params.view_box_height(),
+                LengthDir::Both => {
+                    self.length
+                        * viewport_percentage(params.view_box_width(), params.view_box_height())
                 }
-            }
+            },
 
-            LengthUnit::FontEm => self.length * font_size_from_values(values, draw_ctx),
+            LengthUnit::FontEm => self.length * font_size_from_values(values, params),
 
-            LengthUnit::FontEx => self.length * font_size_from_values(values, draw_ctx) / 2.0,
+            LengthUnit::FontEx => self.length * font_size_from_values(values, params) / 2.0,
 
-            LengthUnit::Inch => font_size_from_inch(self.length, self.dir, draw_ctx),
+            LengthUnit::Inch => font_size_from_inch(self.length, self.dir, params),
         }
     }
 
@@ -138,10 +137,13 @@ impl Length {
         }
     }
 
-    pub fn from_cssparser(parser: &mut Parser, dir: LengthDir) -> Result<Length, AttributeError> {
+    pub fn from_cssparser(
+        parser: &mut Parser<'_, '_>,
+        dir: LengthDir,
+    ) -> Result<Length, ValueErrorKind> {
         let length = {
             let token = parser.next().map_err(|_| {
-                AttributeError::Parse(ParseError::new(
+                ValueErrorKind::Parse(ParseError::new(
                     "expected number and optional symbol, or number and percentage",
                 ))
             })?;
@@ -225,26 +227,27 @@ impl Length {
     }
 }
 
-fn font_size_from_inch(length: f64, dir: LengthDir, draw_ctx: &DrawingCtx) -> f64 {
-    let (dpi_x, dpi_y) = draw_ctx.get_dpi();
-
+fn font_size_from_inch(length: f64, dir: LengthDir, params: &ViewParams) -> f64 {
     match dir {
-        LengthDir::Horizontal => length * dpi_x,
-        LengthDir::Vertical => length * dpi_y,
-        LengthDir::Both => length * viewport_percentage(dpi_x, dpi_y),
+        LengthDir::Horizontal => length * params.dpi_x(),
+        LengthDir::Vertical => length * params.dpi_y(),
+        LengthDir::Both => length * viewport_percentage(params.dpi_x(), params.dpi_y()),
     }
 }
 
-fn font_size_from_values(values: &ComputedValues, draw_ctx: &DrawingCtx) -> f64 {
+fn font_size_from_values(values: &ComputedValues, params: &ViewParams) -> f64 {
     let v = &values.font_size.0.value();
 
     match v.unit {
         LengthUnit::Default => v.length,
 
-        LengthUnit::Inch => font_size_from_inch(v.length, v.dir, draw_ctx),
+        LengthUnit::Inch => font_size_from_inch(v.length, v.dir, params),
 
-        LengthUnit::Percent | LengthUnit::FontEm | LengthUnit::FontEx => {
-            unreachable!("ComputedValues can't have a relative font size")
+        LengthUnit::Percent => unreachable!("ComputedValues can't have a relative font size"),
+
+        LengthUnit::FontEm | LengthUnit::FontEx => {
+            // This is the same default as used in rsvg_node_svg_get_size()
+            v.hand_normalize(0.0, 0.0, 12.0)
         }
     }
 }
@@ -255,111 +258,6 @@ fn viewport_percentage(x: f64, y: f64) -> f64 {
     // percentage is calculated as the specified percentage of
     // sqrt((actual-width)**2 + (actual-height)**2))/sqrt(2)."
     (x * x + y * y).sqrt() / SQRT_2
-}
-
-#[derive(Debug, Copy, Clone, PartialEq)]
-pub enum FontSizeSpec {
-    Smaller,
-    Larger,
-    XXSmall,
-    XSmall,
-    Small,
-    Medium,
-    Large,
-    XLarge,
-    XXLarge,
-    Value(Length),
-}
-
-impl FontSizeSpec {
-    pub fn value(&self) -> Length {
-        match self {
-            FontSizeSpec::Value(s) => s.clone(),
-            _ => unreachable!(),
-        }
-    }
-
-    pub fn compute(&self, v: &ComputedValues) -> Self {
-        let compute_points = |p| 12.0 * 1.2f64.powf(p) / POINTS_PER_INCH;
-
-        let size = v.font_size.0.value();
-
-        let new_size = match self {
-            FontSizeSpec::Smaller => Length::new(size.length / 1.2, size.unit, LengthDir::Both),
-            FontSizeSpec::Larger => Length::new(size.length * 1.2, size.unit, LengthDir::Both),
-            FontSizeSpec::XXSmall => {
-                Length::new(compute_points(-3.0), LengthUnit::Inch, LengthDir::Both)
-            }
-            FontSizeSpec::XSmall => {
-                Length::new(compute_points(-2.0), LengthUnit::Inch, LengthDir::Both)
-            }
-            FontSizeSpec::Small => {
-                Length::new(compute_points(-1.0), LengthUnit::Inch, LengthDir::Both)
-            }
-            FontSizeSpec::Medium => {
-                Length::new(compute_points(0.0), LengthUnit::Inch, LengthDir::Both)
-            }
-            FontSizeSpec::Large => {
-                Length::new(compute_points(1.0), LengthUnit::Inch, LengthDir::Both)
-            }
-            FontSizeSpec::XLarge => {
-                Length::new(compute_points(2.0), LengthUnit::Inch, LengthDir::Both)
-            }
-            FontSizeSpec::XXLarge => {
-                Length::new(compute_points(3.0), LengthUnit::Inch, LengthDir::Both)
-            }
-            FontSizeSpec::Value(s) if s.unit == LengthUnit::Percent => {
-                Length::new(size.length * s.length, size.unit, LengthDir::Both)
-            }
-            FontSizeSpec::Value(s) => s.clone(),
-        };
-
-        FontSizeSpec::Value(new_size)
-    }
-
-    pub fn normalize(&self, values: &ComputedValues, draw_ctx: &DrawingCtx) -> f64 {
-        self.value().normalize(values, draw_ctx)
-    }
-}
-
-impl Parse for FontSizeSpec {
-    type Data = ();
-    type Err = AttributeError;
-
-    fn parse(parser: &mut Parser, _: Self::Data) -> Result<FontSizeSpec, ::error::AttributeError> {
-        let parser_state = parser.state();
-
-        Length::parse(parser, LengthDir::Both)
-            .and_then(|s| Ok(FontSizeSpec::Value(s)))
-            .or_else(|e| {
-                parser.reset(&parser_state);
-
-                {
-                    let token = parser.next().map_err(|_| {
-                        ::error::AttributeError::Parse(::parsers::ParseError::new("expected token"))
-                    })?;
-
-                    if let Token::Ident(ref cow) = token {
-                        match cow.as_ref() {
-                            "smaller" => return Ok(FontSizeSpec::Smaller),
-                            "larger" => return Ok(FontSizeSpec::Larger),
-                            "xx-small" => return Ok(FontSizeSpec::XXSmall),
-                            "x-small" => return Ok(FontSizeSpec::XSmall),
-                            "small" => return Ok(FontSizeSpec::Small),
-                            "medium" => return Ok(FontSizeSpec::Medium),
-                            "large" => return Ok(FontSizeSpec::Large),
-                            "x-large" => return Ok(FontSizeSpec::XLarge),
-                            "xx-large" => return Ok(FontSizeSpec::XXLarge),
-                            _ => (),
-                        };
-                    }
-                }
-
-                parser.reset(&parser_state);
-
-                Err(e)
-            })
-    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -376,9 +274,9 @@ impl Default for Dasharray {
 
 impl Parse for Dasharray {
     type Data = ();
-    type Err = AttributeError;
+    type Err = ValueErrorKind;
 
-    fn parse(parser: &mut Parser, _: Self::Data) -> Result<Dasharray, AttributeError> {
+    fn parse(parser: &mut Parser<'_, '_>, _: Self::Data) -> Result<Dasharray, ValueErrorKind> {
         if parser.try(|p| p.expect_ident_matching("none")).is_ok() {
             Ok(Dasharray::None)
         } else {
@@ -388,7 +286,7 @@ impl Parse for Dasharray {
 }
 
 // This does not handle "inherit" or "none" state, the caller is responsible for that.
-fn parse_dash_array(parser: &mut Parser) -> Result<Vec<Length>, AttributeError> {
+fn parse_dash_array(parser: &mut Parser<'_, '_>) -> Result<Vec<Length>, ValueErrorKind> {
     let mut dasharray = Vec::new();
 
     loop {
@@ -409,6 +307,8 @@ fn parse_dash_array(parser: &mut Parser) -> Result<Vec<Length>, AttributeError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use float_eq_cairo::ApproxEqCairo;
 
     #[test]
     fn parses_default() {
@@ -511,11 +411,71 @@ mod tests {
     }
 
     #[test]
-    fn invalid_font_size_yields_error() {
-        assert!(is_parse_error(&FontSizeSpec::parse_str("furlong", ())));
+    fn normalize_default_works() {
+        let params = ViewParams::new(40.0, 40.0, 100.0, 100.0);
+
+        let values = ComputedValues::default();
+
+        assert_approx_eq_cairo!(
+            Length::new(10.0, LengthUnit::Default, LengthDir::Both).normalize(&values, &params),
+            10.0
+        );
     }
 
-    fn parse_dash_array_str(s: &str) -> Result<Dasharray, AttributeError> {
+    #[test]
+    fn normalize_absolute_units_works() {
+        let params = ViewParams::new(40.0, 50.0, 100.0, 100.0);
+
+        let values = ComputedValues::default();
+
+        assert_approx_eq_cairo!(
+            Length::new(10.0, LengthUnit::Inch, LengthDir::Horizontal).normalize(&values, &params),
+            400.0
+        );
+        assert_approx_eq_cairo!(
+            Length::new(10.0, LengthUnit::Inch, LengthDir::Vertical).normalize(&values, &params),
+            500.0
+        );
+    }
+
+    #[test]
+    fn normalize_percent_works() {
+        let params = ViewParams::new(40.0, 40.0, 100.0, 200.0);
+
+        let values = ComputedValues::default();
+
+        assert_approx_eq_cairo!(
+            Length::new(0.05, LengthUnit::Percent, LengthDir::Horizontal)
+                .normalize(&values, &params),
+            5.0
+        );
+        assert_approx_eq_cairo!(
+            Length::new(0.05, LengthUnit::Percent, LengthDir::Vertical).normalize(&values, &params),
+            10.0
+        );
+    }
+
+    #[test]
+    fn normalize_font_em_ex_works() {
+        let params = ViewParams::new(40.0, 40.0, 100.0, 200.0);
+
+        let values = ComputedValues::default();
+
+        // These correspond to the default size for the font-size
+        // property and the way we compute FontEx from that.
+
+        assert_approx_eq_cairo!(
+            Length::new(1.0, LengthUnit::FontEm, LengthDir::Vertical).normalize(&values, &params),
+            12.0
+        );
+
+        assert_approx_eq_cairo!(
+            Length::new(1.0, LengthUnit::FontEx, LengthDir::Vertical).normalize(&values, &params),
+            6.0
+        );
+    }
+
+    fn parse_dash_array_str(s: &str) -> Result<Dasharray, ValueErrorKind> {
         Dasharray::parse_str(s, ())
     }
 
@@ -569,7 +529,7 @@ mod tests {
         // Negative numbers
         assert_eq!(
             parse_dash_array_str("20,40,-20"),
-            Err(AttributeError::Value(String::from(
+            Err(ValueErrorKind::Value(String::from(
                 "value must be non-negative"
             )))
         );

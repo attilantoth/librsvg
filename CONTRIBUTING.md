@@ -51,6 +51,21 @@ resource and attachments are visible to everyone.
 
 You can also [browse the existing bugs][bugs-browse].
 
+### Obtaining debug logs
+
+Librsvg can be asked to output debug logs.  Set the `RSVG_LOG`
+environment variable, and then librsvg will print some 
+information to stdout:
+
+```
+$ RSVG_LOG=1 some-program-that-uses-librsvg
+... debug output goes here ...
+```
+
+As of librsvg 2.43.5, there are no options you can set in the
+`RSVG_LOG` variable; the library just checks whether that environment
+variable is present or not.
+
 ## Feature requests
 
 Librsvg aims to be a small and relatively simple SVG rendering
@@ -146,18 +161,13 @@ of CI pipelines will fail:
     indentation, but don't want it to make changes on its own:  
     `cargo fmt --all -- --check`
 
-***Installing rustfmt*** As of 2018/Jun, our continuous integration
-pipeline assumes the Rust nightly version of rustfmt.  You can install
-it with
+***Installing rustfmt*** As of 2018/Sep, our continuous integration
+pipeline assumes the version of rustfmt that is distributed through the
+nightly channel of [rustup](rustup.rs).  You can install it with
 
 ```
-cargo +nightly install --force rustfmt-nightly
+rustup component add rustfmt-preview --toolchain=nightly
 ```
-
-Note that rustfmt changes frequently.  If the CI pipeline fails on the
-`Lint` stage because your code is formatted differently, try updating
-your rustfmt.  Hopefully this will stabilize once rustfmt reaches
-version 1.0.
 
 ### Test suite
 
@@ -255,6 +265,16 @@ shipped outside of librsvg.  This requires you to first install
 librsvg, and then compile rsvg-bench.  We aim to make this easier in
 the future.  Of course all help is appreciated!
 
+### Included benchmarks
+
+The [`rsvg_internals/benches`][benches] directory has a
+couple of benchmarks for functions related to SVG filter effects.  You
+can run them with `cargo bench`.
+
+These benchmarks use the [Criterion] crate, which supports some
+interesting options to generate plots and such.  You can see the
+[Criterion command line options][criterion-options].
+
 [coc]: code-of-conduct.md
 [gitlab]: https://gitlab.gnome.org/GNOME/librsvg
 [bugs-browse]: https://gitlab.gnome.org/GNOME/librsvg/issues
@@ -266,3 +286,6 @@ the future.  Of course all help is appreciated!
 [rsvg-bench]: https://gitlab.gnome.org/federico/rsvg-bench
 [rsvg-rs]: https://github.com/selaux/rsvg-rs
 [arch]: ARCHITECTURE.md
+[benches]: rsvg-internals/benches
+[Criterion]: https://crates.io/crates/criterion
+[criterion-options]: https://japaric.github.io/criterion.rs/book/user_guide/command_line_options.html

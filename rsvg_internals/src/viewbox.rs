@@ -27,7 +27,7 @@ impl ViewBox {
 
 impl Parse for ViewBox {
     type Data = ();
-    type Err = AttributeError;
+    type Err = ValueErrorKind;
 
     // Parse a viewBox attribute
     // https://www.w3.org/TR/SVG/coords.html#ViewBoxAttribute
@@ -37,7 +37,7 @@ impl Parse for ViewBox {
     // x, y, w, h
     //
     // Where w and h must be nonnegative.
-    fn parse(parser: &mut Parser, _: ()) -> Result<ViewBox, AttributeError> {
+    fn parse(parser: &mut Parser<'_, '_>, _: ()) -> Result<ViewBox, ValueErrorKind> {
         let v = parsers::number_list(parser, ListLength::Exact(4))
             .map_err(|_| ParseError::new("string does not match 'x [,] y [,] w [,] h'"))?;
 
@@ -51,7 +51,7 @@ impl Parse for ViewBox {
                 height: h,
             }))
         } else {
-            Err(AttributeError::Value(
+            Err(ValueErrorKind::Value(
                 "width and height must not be negative".to_string(),
             ))
         }
@@ -86,5 +86,8 @@ mod tests {
         assert!(is_parse_error(&ViewBox::parse_str(" 1 2 3 4   5", ())));
 
         assert!(is_parse_error(&ViewBox::parse_str(" 1 2 foo 3 4", ())));
+
+        // https://gitlab.gnome.org/GNOME/librsvg/issues/344
+        assert!(is_parse_error(&ViewBox::parse_str("0 0 9E80.7", ())));
     }
 }

@@ -1,19 +1,20 @@
 use std::cell::{Cell, RefCell};
 use std::ops::Deref;
+use std::time::Instant;
 
-use cairo;
+use cairo::{self, MatrixTrait};
 use owning_ref::RcRef;
 
 use attributes::Attribute;
 use coord_units::CoordUnits;
 use drawing_ctx::DrawingCtx;
-use error::AttributeError;
+use error::ValueErrorKind;
 use handle::RsvgHandle;
 use length::{Length, LengthDir, LengthUnit};
 use node::{NodeResult, NodeTrait, NodeType, RsvgNode};
 use parsers::{parse_and_validate, ParseError};
 use property_bag::PropertyBag;
-use state::ColorInterpolationFilters;
+use state::{ColorInterpolationFilters, ComputedValues};
 use surface_utils::shared_surface::{SharedImageSurface, SurfaceType};
 
 mod bounds;
@@ -57,7 +58,7 @@ trait Filter: NodeTrait {
         &self,
         node: &RsvgNode,
         ctx: &FilterContext,
-        draw_ctx: &mut DrawingCtx,
+        draw_ctx: &mut DrawingCtx<'_>,
     ) -> Result<FilterResult, FilterError>;
 
     /// Returns `true` if this filter primitive is affected by the `color-interpolation-filters`
@@ -110,7 +111,12 @@ impl Primitive {
 }
 
 impl NodeTrait for Primitive {
-    fn set_atts(&self, node: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag) -> NodeResult {
+    fn set_atts(
+        &self,
+        node: &RsvgNode,
+        _: *const RsvgHandle,
+        pbag: &PropertyBag<'_>,
+    ) -> NodeResult {
         // With ObjectBoundingBox, only fractions and percents are allowed.
         let primitiveunits = node
             .get_parent()
@@ -120,8 +126,7 @@ impl NodeTrait for Primitive {
                 } else {
                     None
                 }
-            })
-            .unwrap_or(CoordUnits::UserSpaceOnUse);
+            }).unwrap_or(CoordUnits::UserSpaceOnUse);
 
         let no_units_allowed = primitiveunits == CoordUnits::ObjectBoundingBox;
         let check_units = |length: Length| {
@@ -131,7 +136,7 @@ impl NodeTrait for Primitive {
 
             match length.unit {
                 LengthUnit::Default | LengthUnit::Percent => Ok(length),
-                _ => Err(AttributeError::Parse(ParseError::new(
+                _ => Err(ValueErrorKind::Parse(ParseError::new(
                     "unit identifiers are not allowed with primitiveUnits set to objectBoundingBox",
                 ))),
             }
@@ -189,7 +194,7 @@ impl PrimitiveWithInput {
     fn get_input(
         &self,
         ctx: &FilterContext,
-        draw_ctx: &mut DrawingCtx,
+        draw_ctx: &mut DrawingCtx<'_>,
     ) -> Result<FilterInput, FilterError> {
         ctx.get_input(draw_ctx, self.in_.borrow().as_ref())
     }
@@ -200,7 +205,7 @@ impl NodeTrait for PrimitiveWithInput {
         &self,
         node: &RsvgNode,
         handle: *const RsvgHandle,
-        pbag: &PropertyBag,
+        pbag: &PropertyBag<'_>,
     ) -> NodeResult {
         self.base.set_atts(node, handle, pbag)?;
 
@@ -227,9 +232,9 @@ impl Deref for PrimitiveWithInput {
 /// Applies a filter and returns the resulting surface.
 pub fn render(
     filter_node: &RsvgNode,
-    node_being_filtered: &RsvgNode,
+    computed_from_node_being_filtered: &ComputedValues,
     source: &cairo::ImageSurface,
-    draw_ctx: &mut DrawingCtx,
+    draw_ctx: &mut DrawingCtx<'_>,
 ) -> cairo::ImageSurface {
     let filter_node = &*filter_node;
     assert_eq!(filter_node.get_type(), NodeType::Filter);
@@ -249,13 +254,38 @@ pub fn render(
     }
     let source_surface = SharedImageSurface::new(source_surface, SurfaceType::SRgb).unwrap();
 
-    let mut filter_ctx =
-        FilterContext::new(filter_node, node_being_filtered, source_surface, draw_ctx);
+    let mut filter_ctx = FilterContext::new(
+        filter_node,
+        computed_from_node_being_filtered,
+        source_surface,
+        draw_ctx,
+    );
+
+    // If paffine is non-invertible, we won't draw anything. Also bbox combining in bounds
+    // computations will panic due to non-invertible martrix.
+    if filter_ctx.paffine().try_invert().is_err() {
+        return filter_ctx
+            .into_output()
+            .expect("could not create an empty surface to return from a filter")
+            .into_image_surface()
+            .expect("could not convert filter output into an ImageSurface");
+    }
 
     filter_node
         .children()
         // Skip nodes in error.
-        .filter(|c| !c.is_in_error())
+        .filter(|c| {
+            let in_error = c.is_in_error();
+
+            if in_error {
+                rsvg_log!(
+                    "(ignoring filter primitive {} because it is in error)",
+                    c.get_human_readable_name()
+                );
+            }
+
+            !in_error
+        })
         // Check if the node wants linear RGB.
         .map(|c| {
             let linear_rgb = {
@@ -266,67 +296,78 @@ pub fn render(
             };
 
             (c, linear_rgb)
-        })
-        .filter_map(|(c, linear_rgb)| {
-            let rr = RcRef::new(c).try_map(|c| {
-                // Go through the filter primitives and see if the node is one of them.
-                #[inline]
-                fn as_filter<T: Filter>(x: &T) -> &Filter {
-                    x
-                }
+        }).filter_map(|(c, linear_rgb)| {
+            let rr = RcRef::new(c)
+                .try_map(|c| {
+                    // Go through the filter primitives and see if the node is one of them.
+                    #[inline]
+                    fn as_filter<T: Filter>(x: &T) -> &Filter {
+                        x
+                    }
 
-                // Unfortunately it's not possible to downcast to a trait object. If we could
-                // attach arbitrary data to nodes it would really help here. Previously that
-                // arbitrary data was in form of RsvgCNodeImpl, but that was heavily tuned for
-                // storing C pointers with all subsequent downsides.
-                macro_rules! try_downcasting_to_filter {
-                    ($c:expr; $($t:ty),+$(,)*) => ({
-                        let mut filter = None;
-                        $(
-                            filter = filter.or_else(|| $c.get_impl::<$t>().map(as_filter));
-                        )+
-                        filter
-                    })
-                }
+                    // Unfortunately it's not possible to downcast to a trait object. If we could
+                    // attach arbitrary data to nodes it would really help here. Previously that
+                    // arbitrary data was in form of RsvgCNodeImpl, but that was heavily tuned for
+                    // storing C pointers with all subsequent downsides.
+                    macro_rules! try_downcasting_to_filter {
+                        ($c:expr; $($t:ty),+$(,)*) => ({
+                            let mut filter = None;
+                            $(
+                                filter = filter.or_else(|| $c.get_impl::<$t>().map(as_filter));
+                            )+
+                            filter
+                        })
+                    }
 
-                let filter = try_downcasting_to_filter!(
-                    c;
-                    blend::Blend,
-                    color_matrix::ColorMatrix,
-                    component_transfer::ComponentTransfer,
-                    composite::Composite,
-                    convolve_matrix::ConvolveMatrix,
-                    displacement_map::DisplacementMap,
-                    flood::Flood,
-                    gaussian_blur::GaussianBlur,
-                    image::Image,
-                    light::diffuse_lighting::DiffuseLighting,
-                    light::specular_lighting::SpecularLighting,
-                    merge::Merge,
-                    morphology::Morphology,
-                    offset::Offset,
-                    tile::Tile,
-                    turbulence::Turbulence,
-                );
-                filter.ok_or(())
-            }).ok();
+                    let filter = try_downcasting_to_filter!(c;
+                        blend::Blend,
+                        color_matrix::ColorMatrix,
+                        component_transfer::ComponentTransfer,
+                        composite::Composite,
+                        convolve_matrix::ConvolveMatrix,
+                        displacement_map::DisplacementMap,
+                        flood::Flood,
+                        gaussian_blur::GaussianBlur,
+                        image::Image,
+                        light::lighting::Lighting,
+                        merge::Merge,
+                        morphology::Morphology,
+                        offset::Offset,
+                        tile::Tile,
+                        turbulence::Turbulence,
+                    );
+                    filter.ok_or(())
+                }).ok();
 
             rr.map(|rr| (rr, linear_rgb))
-        })
-        .for_each(|(rr, linear_rgb)| {
+        }).for_each(|(rr, linear_rgb)| {
             let mut render = |filter_ctx: &mut FilterContext| {
-                if let Err(_) = rr.render(rr.owner(), filter_ctx, draw_ctx)
+                if let Err(err) = rr
+                    .render(rr.owner(), filter_ctx, draw_ctx)
                     .and_then(|result| filter_ctx.store_result(result))
                 {
-                    // Filter::render() returned an error. Do nothing for now.
+                    rsvg_log!(
+                        "(filter primitive {} returned an error: {})",
+                        rr.owner().get_human_readable_name(),
+                        err
+                    );
                 }
             };
+
+            let start = Instant::now();
 
             if rr.is_affected_by_color_interpolation_filters() && linear_rgb {
                 filter_ctx.with_linear_rgb(render);
             } else {
                 render(&mut filter_ctx);
             }
+
+            let elapsed = start.elapsed();
+            rsvg_log!(
+                "(rendered filter primitive {} in\n    {} seconds)",
+                rr.owner().get_human_readable_name(),
+                elapsed.as_secs() as f64 + f64::from(elapsed.subsec_nanos()) / 1e9
+            );
         });
 
     filter_ctx

@@ -1,7 +1,7 @@
 use cssparser::Parser;
 
 use error::*;
-use parsers::{Parse, ParseError};
+use parsers::{CssParserExt, Parse, ParseError};
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct UnitInterval(pub f64);
@@ -14,13 +14,13 @@ impl Default for UnitInterval {
 
 impl Parse for UnitInterval {
     type Data = ();
-    type Err = AttributeError;
+    type Err = ValueErrorKind;
 
-    fn parse(parser: &mut Parser, _: ()) -> Result<UnitInterval, AttributeError> {
+    fn parse(parser: &mut Parser<'_, '_>, _: ()) -> Result<UnitInterval, ValueErrorKind> {
         let x = f64::from(
             parser
-                .expect_number()
-                .map_err(|_| AttributeError::Parse(ParseError::new("expected number")))?,
+                .expect_finite_number()
+                .map_err(|_| ValueErrorKind::Parse(ParseError::new("expected number")))?,
         );
 
         let cx = if x < 0.0 {

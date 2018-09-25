@@ -12,6 +12,8 @@ use aspect_ratio::AspectRatio;
 use attributes::Attribute;
 use bbox::BoundingBox;
 use drawing_ctx::DrawingCtx;
+use error::RenderingError;
+use float_eq_cairo::ApproxEqCairo;
 use handle::RsvgHandle;
 use length::*;
 use node::*;
@@ -45,7 +47,7 @@ impl NodeTrait for NodeImage {
         &self,
         node: &RsvgNode,
         handle: *const RsvgHandle,
-        pbag: &PropertyBag,
+        pbag: &PropertyBag<'_>,
     ) -> NodeResult {
         // SVG element has overflow:hidden
         // https://www.w3.org/TR/SVG/styling.html#UAStyleSheet
@@ -107,17 +109,23 @@ impl NodeTrait for NodeImage {
     fn draw(
         &self,
         node: &RsvgNode,
-        cascaded: &CascadedValues,
-        draw_ctx: &mut DrawingCtx,
+        cascaded: &CascadedValues<'_>,
+        draw_ctx: &mut DrawingCtx<'_>,
         clipping: bool,
-    ) {
+    ) -> Result<(), RenderingError> {
         let values = cascaded.get();
 
         if let Some(ref surface) = *self.surface.borrow() {
-            let x = self.x.get().normalize(values, draw_ctx);
-            let y = self.y.get().normalize(values, draw_ctx);
-            let w = self.w.get().normalize(values, draw_ctx);
-            let h = self.h.get().normalize(values, draw_ctx);
+            let params = draw_ctx.get_view_params();
+
+            let x = self.x.get().normalize(values, &params);
+            let y = self.y.get().normalize(values, &params);
+            let w = self.w.get().normalize(values, &params);
+            let h = self.h.get().normalize(values, &params);
+
+            if w.approx_eq_cairo(&0.0) || h.approx_eq_cairo(&0.0) {
+                return Ok(());
+            }
 
             draw_ctx.with_discrete_layer(node, values, clipping, &mut |dc| {
                 let aspect = self.aspect.get();
@@ -140,7 +148,7 @@ impl NodeTrait for NodeImage {
                 let width = surface.get_width();
                 let height = surface.get_height();
                 if clipping || width == 0 || height == 0 {
-                    return;
+                    return Ok(());
                 }
 
                 let width = f64::from(width);
@@ -182,7 +190,10 @@ impl NodeTrait for NodeImage {
                 cr.restore();
 
                 dc.insert_bbox(&bbox);
-            });
+                Ok(())
+            })
+        } else {
+            Ok(())
         }
     }
 }

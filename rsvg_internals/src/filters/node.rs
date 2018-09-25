@@ -3,7 +3,7 @@ use std::cell::Cell;
 
 use attributes::Attribute;
 use coord_units::CoordUnits;
-use error::AttributeError;
+use error::ValueErrorKind;
 use handle::RsvgHandle;
 use length::{Length, LengthDir, LengthUnit};
 use node::{NodeResult, NodeTrait, RsvgNode};
@@ -40,7 +40,7 @@ impl NodeTrait for NodeFilter {
         &self,
         _node: &RsvgNode,
         _handle: *const RsvgHandle,
-        pbag: &PropertyBag,
+        pbag: &PropertyBag<'_>,
     ) -> NodeResult {
         // Parse filterUnits first as it affects x, y, width, height checks.
         for (_key, attr, value) in pbag.iter() {
@@ -59,7 +59,7 @@ impl NodeTrait for NodeFilter {
 
             match length.unit {
                 LengthUnit::Default | LengthUnit::Percent => Ok(length),
-                _ => Err(AttributeError::Parse(ParseError::new(
+                _ => Err(ValueErrorKind::Parse(ParseError::new(
                     "unit identifiers are not allowed with filterUnits set to objectBoundingBox",
                 ))),
             }

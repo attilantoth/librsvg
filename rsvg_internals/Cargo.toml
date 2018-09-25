@@ -33,7 +33,9 @@ lazy_static = "1.0.0"
 phf = "0.7.21"
 float-cmp = "0.4.0"
 nalgebra = "0.16"
+num-traits = "0.2"
 owning_ref = "0.3"
+rayon = "1"
 
 [dependencies.cairo-sys-rs]
 version = "0.6"
@@ -73,5 +75,17 @@ name = "box_blur"
 harness = false
 
 [[bench]]
+name = "composite"
+harness = false
+
+[[bench]]
+name = "lighting"
+harness = false
+
+[[bench]]
 name = "pixel_iterators"
+harness = false
+
+[[bench]]
+name = "srgb"
 harness = false

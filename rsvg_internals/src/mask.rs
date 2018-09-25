@@ -6,12 +6,21 @@ use std::cell::Cell;
 use attributes::Attribute;
 use coord_units::CoordUnits;
 use drawing_ctx::DrawingCtx;
+use error::RenderingError;
+use filters::context::IRect;
 use handle::RsvgHandle;
 use length::{Length, LengthDir};
 use node::{NodeResult, NodeTrait, RsvgNode};
 use parsers::{parse, parse_and_validate, Parse};
 use property_bag::PropertyBag;
 use state::Opacity;
+use surface_utils::{
+    iterators::Pixels,
+    shared_surface::SharedImageSurface,
+    shared_surface::SurfaceType,
+    ImageSurfaceDataExt,
+    Pixel,
+};
 
 coord_units!(MaskUnits, CoordUnits::ObjectBoundingBox);
 coord_units!(MaskContentUnits, CoordUnits::UserSpaceOnUse);
@@ -61,38 +70,47 @@ impl NodeMask {
         &self,
         node: &RsvgNode,
         affine_before_mask: &cairo::Matrix,
-        draw_ctx: &mut DrawingCtx,
-    ) {
+        draw_ctx: &mut DrawingCtx<'_>,
+    ) -> Result<(), RenderingError> {
         let cascaded = node.get_cascaded_values();
         let values = cascaded.get();
 
         let width = draw_ctx.get_width() as i32;
         let height = draw_ctx.get_height() as i32;
 
-        let mut surface = match cairo::ImageSurface::create(cairo::Format::ARgb32, width, height) {
-            Ok(surface) => surface,
-            Err(_) => return,
-        };
+        let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, width, height)?;
 
         let mask_units = CoordUnits::from(self.units.get());
         let content_units = CoordUnits::from(self.content_units.get());
 
-        if mask_units == CoordUnits::ObjectBoundingBox {
-            draw_ctx.push_view_box(1.0, 1.0);
-        }
+        let (x, y, w, h) = {
+            let params = if mask_units == CoordUnits::ObjectBoundingBox {
+                draw_ctx.push_view_box(1.0, 1.0)
+            } else {
+                draw_ctx.get_view_params()
+            };
 
-        let x = self.x.get().normalize(&values, draw_ctx);
-        let y = self.y.get().normalize(&values, draw_ctx);
-        let w = self.width.get().normalize(&values, draw_ctx);
-        let h = self.height.get().normalize(&values, draw_ctx);
+            let x = self.x.get().normalize(&values, &params);
+            let y = self.y.get().normalize(&values, &params);
+            let w = self.width.get().normalize(&values, &params);
+            let h = self.height.get().normalize(&values, &params);
 
-        if mask_units == CoordUnits::ObjectBoundingBox {
-            draw_ctx.pop_view_box();
-        }
+            (x, y, w, h)
+        };
 
         // Use a scope because mask_cr needs to release the
         // reference to the surface before we access the pixels
         {
+            let bbox_rect = {
+                if let Some(ref rect) = draw_ctx.get_bbox().rect {
+                    *rect
+                } else {
+                    // The node being masked is empty / doesn't have a
+                    // bounding box, so there's nothing to mask!
+                    return Ok(());
+                }
+            };
+
             let save_cr = draw_ctx.get_cairo_context();
 
             let mask_cr = cairo::Context::new(&surface);
@@ -102,91 +120,132 @@ impl NodeMask {
             draw_ctx.set_cairo_context(&mask_cr);
 
             if mask_units == CoordUnits::ObjectBoundingBox {
-                let rect = {
-                    let bbox = draw_ctx.get_bbox();
-                    bbox.rect.unwrap()
-                };
-
                 draw_ctx.clip(
-                    x * rect.width + rect.x,
-                    y * rect.height + rect.y,
-                    w * rect.width,
-                    h * rect.height,
+                    x * bbox_rect.width + bbox_rect.x,
+                    y * bbox_rect.height + bbox_rect.y,
+                    w * bbox_rect.width,
+                    h * bbox_rect.height,
                 );
             } else {
                 draw_ctx.clip(x, y, w, h);
             }
 
-            if content_units == CoordUnits::ObjectBoundingBox {
-                let rect = {
-                    let bbox = draw_ctx.get_bbox();
-                    bbox.rect.unwrap()
+            {
+                let _params = if content_units == CoordUnits::ObjectBoundingBox {
+                    let bbtransform = cairo::Matrix::new(
+                        bbox_rect.width,
+                        0.0,
+                        0.0,
+                        bbox_rect.height,
+                        bbox_rect.x,
+                        bbox_rect.y,
+                    );
+
+                    mask_cr.transform(bbtransform);
+
+                    draw_ctx.push_view_box(1.0, 1.0)
+                } else {
+                    draw_ctx.get_view_params()
                 };
-                let bbtransform =
-                    cairo::Matrix::new(rect.width, 0.0, 0.0, rect.height, rect.x, rect.y);
 
-                mask_cr.transform(bbtransform);
+                let res = draw_ctx.with_discrete_layer(node, values, false, &mut |dc| {
+                    node.draw_children(&cascaded, dc, false)
+                });
 
-                draw_ctx.push_view_box(1.0, 1.0);
+                draw_ctx.set_cairo_context(&save_cr);
+
+                res
             }
+        }?;
 
-            draw_ctx.with_discrete_layer(node, values, false, &mut |dc| {
-                node.draw_children(&cascaded, dc, false);
-            });
+        let opacity = {
+            let Opacity(o) = values.opacity;
+            u8::from(o)
+        };
 
-            if content_units == CoordUnits::ObjectBoundingBox {
-                draw_ctx.pop_view_box();
-            }
-
-            draw_ctx.set_cairo_context(&save_cr);
-        }
-
-        {
-            let rowstride = surface.get_stride() as usize;
-            let mut pixels = surface.get_data().unwrap();
-            let opacity = {
-                let Opacity(o) = values.opacity;
-                u8::from(o)
-            };
-
-            for row in pixels.chunks_mut(rowstride) {
-                for p in row[..4 * width as usize].chunks_mut(4) {
-                    //  Assuming, the pixel is linear RGB (not sRGB)
-                    //  y = luminance
-                    //  Y = 0.2126 R + 0.7152 G + 0.0722 B
-                    //  1.0 opacity = 255
-                    //
-                    //  When Y = 1.0, pixel for mask should be 0xFFFFFFFF
-                    //    (you get 1.0 luminance from 255 from R, G and B)
-                    //
-                    // r_mult = 0xFFFFFFFF / (255.0 * 255.0) * .2126 = 14042.45  ~= 14042
-                    // g_mult = 0xFFFFFFFF / (255.0 * 255.0) * .7152 = 47239.69  ~= 47240
-                    // b_mult = 0xFFFFFFFF / (255.0 * 255.0) * .0722 =  4768.88  ~= 4769
-                    //
-                    // This allows for the following expected behaviour:
-                    //    (we only care about the most sig byte)
-                    // if pixel = 0x00FFFFFF, pixel' = 0xFF......
-                    // if pixel = 0x00020202, pixel' = 0x02......
-                    // if pixel = 0x00000000, pixel' = 0x00......
-                    //
-                    // NOTE: the following assumes little-endian
-                    let (r, g, b, o) = (p[2] as u32, p[1] as u32, p[0] as u32, opacity as u32);
-                    p[3] = (((r * 14042 + g * 47240 + b * 4769) * o) >> 24) as u8;
-                }
-            }
-        }
+        let mask_surface = compute_luminance_to_alpha(surface, opacity)?;
 
         let cr = draw_ctx.get_cairo_context();
 
         cr.identity_matrix();
 
         let (xofs, yofs) = draw_ctx.get_offset();
-        cairo_mask_surface(&cr, &surface, xofs, yofs);
+        cairo_mask_surface(&cr, &mask_surface, xofs, yofs);
+
+        Ok(())
     }
 }
 
+// Returns a surface whose alpha channel for each pixel is equal to the
+// luminance of that pixel's unpremultiplied RGB values.  The resulting
+// surface's RGB values are not meanignful; only the alpha channel has
+// useful luminance data.
+//
+// This is to get a mask suitable for use with cairo_mask_surface().
+fn compute_luminance_to_alpha(
+    surface: cairo::ImageSurface,
+    opacity: u8,
+) -> Result<cairo::ImageSurface, cairo::Status> {
+    let surface = SharedImageSurface::new(surface, SurfaceType::SRgb)?;
+
+    let width = surface.width();
+    let height = surface.height();
+
+    let bounds = IRect {
+        x0: 0,
+        y0: 0,
+        x1: width,
+        y1: height,
+    };
+
+    let opacity = opacity as u32;
+
+    let mut output = cairo::ImageSurface::create(cairo::Format::ARgb32, width, height)?;
+
+    let output_stride = output.get_stride() as usize;
+
+    {
+        let mut output_data = output.get_data().unwrap();
+
+        for (x, y, pixel) in Pixels::new(&surface, bounds) {
+            //  Assuming, the pixel is linear RGB (not sRGB)
+            //  y = luminance
+            //  Y = 0.2126 R + 0.7152 G + 0.0722 B
+            //  1.0 opacity = 255
+            //
+            //  When Y = 1.0, pixel for mask should be 0xFFFFFFFF
+            //    (you get 1.0 luminance from 255 from R, G and B)
+            //
+            // r_mult = 0xFFFFFFFF / (255.0 * 255.0) * .2126 = 14042.45  ~= 14042
+            // g_mult = 0xFFFFFFFF / (255.0 * 255.0) * .7152 = 47239.69  ~= 47240
+            // b_mult = 0xFFFFFFFF / (255.0 * 255.0) * .0722 =  4768.88  ~= 4769
+            //
+            // This allows for the following expected behaviour:
+            //    (we only care about the most sig byte)
+            // if pixel = 0x00FFFFFF, pixel' = 0xFF......
+            // if pixel = 0x00020202, pixel' = 0x02......
+            // if pixel = 0x00000000, pixel' = 0x00......
+
+            let r = pixel.r as u32;
+            let g = pixel.g as u32;
+            let b = pixel.b as u32;
+
+            let output_pixel = Pixel {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: (((r * 14042 + g * 47240 + b * 4769) * opacity) >> 24) as u8,
+            };
+
+            output_data.set_pixel(output_stride, output_pixel, x, y);
+        }
+    }
+
+    Ok(output)
+}
+
 impl NodeTrait for NodeMask {
-    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag) -> NodeResult {
+    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag<'_>) -> NodeResult {
         for (_key, attr, value) in pbag.iter() {
             match attr {
                 Attribute::X => self.x.set(parse("x", value, LengthDir::Horizontal)?),

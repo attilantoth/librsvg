@@ -192,6 +192,7 @@ impl<'b> PathParser<'b> {
             sign = -1.0;
         }
 
+        let mut has_integer_part = false;
         let mut value: f64;
         let mut exponent_sign: f64;
         let mut exponent: Option<f64>;
@@ -205,6 +206,7 @@ impl<'b> PathParser<'b> {
         if self.lookahead_is_digit(&mut c) || self.lookahead_is('.') {
             // Integer part
             while self.lookahead_is_digit(&mut c) {
+                has_integer_part = true;
                 value = value * 10.0 + f64::from(char_to_digit(c));
 
                 assert!(self.match_char(c));
@@ -215,6 +217,12 @@ impl<'b> PathParser<'b> {
                 let mut fraction: f64 = 1.0;
 
                 let mut c: char = ' ';
+
+                if !has_integer_part {
+                    if !self.lookahead_is_digit(&mut c) {
+                        return Err(self.error(ErrorKind::UnexpectedToken));
+                    }
+                }
 
                 while self.lookahead_is_digit(&mut c) {
                     fraction /= 10.0;
@@ -913,7 +921,7 @@ impl Error for ParseError {
 }
 
 impl Display for ParseError {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "error at position {}: {}",
@@ -933,6 +941,7 @@ pub fn parse_path_into_builder(
 }
 
 #[cfg(test)]
+#[cfg_attr(rustfmt, rustfmt_skip)]
 mod tests {
     use super::*;
 
@@ -981,7 +990,11 @@ mod tests {
     }
 
     fn curveto(x2: f64, y2: f64, x3: f64, y3: f64, x4: f64, y4: f64) -> PathCommand {
-        PathCommand::CurveTo((x2, y2), (x3, y3), (x4, y4))
+        PathCommand::CurveTo(CubicBezierCurve {
+            pt1: (x2, y2),
+            pt2: (x3, y3),
+            to: (x4, y4),
+        })
     }
 
     fn closepath() -> PathCommand {
@@ -1000,25 +1013,75 @@ mod tests {
 
     #[test]
     fn handles_numbers() {
-        test_parser("M 10 20", "", &vec![moveto(10.0, 20.0)], None);
+        test_parser(
+            "M 10 20",
+            "",
+            &vec![moveto(10.0, 20.0)],
+            None,
+        );
 
-        test_parser("M -10 -20", "", &vec![moveto(-10.0, -20.0)], None);
+        test_parser(
+            "M -10 -20",
+            "",
+            &vec![moveto(-10.0, -20.0)],
+            None,
+        );
 
-        test_parser("M .10 0.20", "", &vec![moveto(0.10, 0.20)], None);
+        test_parser(
+            "M .10 0.20",
+            "",
+            &vec![moveto(0.10, 0.20)],
+            None,
+        );
 
-        test_parser("M -.10 -0.20", "", &vec![moveto(-0.10, -0.20)], None);
+        test_parser(
+            "M -.10 -0.20",
+            "",
+            &vec![moveto(-0.10, -0.20)],
+            None,
+        );
 
-        test_parser("M-.10-0.20", "", &vec![moveto(-0.10, -0.20)], None);
+        test_parser(
+            "M-.10-0.20",
+            "",
+            &vec![moveto(-0.10, -0.20)],
+            None,
+        );
 
-        test_parser("M10.5.50", "", &vec![moveto(10.5, 0.50)], None);
+        test_parser(
+            "M10.5.50",
+            "",
+            &vec![moveto(10.5, 0.50)],
+            None,
+        );
 
-        test_parser("M.10.20", "", &vec![moveto(0.10, 0.20)], None);
+        test_parser(
+            "M.10.20",
+            "",
+            &vec![moveto(0.10, 0.20)],
+            None,
+        );
 
-        test_parser("M .10E1 .20e-4", "", &vec![moveto(1.0, 0.000020)], None);
+        test_parser(
+            "M .10E1 .20e-4",
+            "",
+            &vec![moveto(1.0, 0.000020)],
+            None,
+        );
 
-        test_parser("M-.10E1-.20", "", &vec![moveto(-1.0, -0.20)], None);
+        test_parser(
+            "M-.10E1-.20",
+            "",
+            &vec![moveto(-1.0, -0.20)],
+            None,
+        );
 
-        test_parser("M10.10E2 -0.20e3", "", &vec![moveto(1010.0, -200.0)], None);
+        test_parser(
+            "M10.10E2 -0.20e3",
+            "",
+            &vec![moveto(1010.0, -200.0)],
+            None,
+        );
 
         test_parser(
             "M-10.10E2-0.20e-3",
@@ -1030,17 +1093,47 @@ mod tests {
 
     #[test]
     fn detects_bogus_numbers() {
-        test_parser("M+", "  ^", &vec![], Some(ErrorKind::UnexpectedEof));
+        test_parser(
+            "M+",
+            "  ^",
+            &vec![],
+            Some(ErrorKind::UnexpectedEof),
+        );
 
-        test_parser("M-", "  ^", &vec![], Some(ErrorKind::UnexpectedEof));
+        test_parser(
+            "M-",
+            "  ^",
+            &vec![],
+            Some(ErrorKind::UnexpectedEof),
+        );
 
-        test_parser("M+x", "  ^", &vec![], Some(ErrorKind::UnexpectedToken));
+        test_parser(
+            "M+x",
+            "  ^",
+            &vec![],
+            Some(ErrorKind::UnexpectedToken),
+        );
 
-        test_parser("M10e", "    ^", &vec![], Some(ErrorKind::UnexpectedEof));
+        test_parser(
+            "M10e",
+            "    ^",
+            &vec![],
+            Some(ErrorKind::UnexpectedEof),
+        );
 
-        test_parser("M10ex", "    ^", &vec![], Some(ErrorKind::UnexpectedToken));
+        test_parser(
+            "M10ex",
+            "    ^",
+            &vec![],
+            Some(ErrorKind::UnexpectedToken),
+        );
 
-        test_parser("M10e-", "     ^", &vec![], Some(ErrorKind::UnexpectedEof));
+        test_parser(
+            "M10e-",
+            "     ^",
+            &vec![],
+            Some(ErrorKind::UnexpectedEof),
+        );
 
         test_parser(
             "M10e+x",
@@ -1052,23 +1145,68 @@ mod tests {
 
     #[test]
     fn handles_numbers_with_comma() {
-        test_parser("M 10, 20", "", &vec![moveto(10.0, 20.0)], None);
+        test_parser(
+            "M 10, 20",
+            "",
+            &vec![moveto(10.0, 20.0)],
+            None,
+        );
 
-        test_parser("M -10,-20", "", &vec![moveto(-10.0, -20.0)], None);
+        test_parser(
+            "M -10,-20",
+            "",
+            &vec![moveto(-10.0, -20.0)],
+            None,
+        );
 
-        test_parser("M.10    ,    0.20", "", &vec![moveto(0.10, 0.20)], None);
+        test_parser(
+            "M.10    ,    0.20",
+            "",
+            &vec![moveto(0.10, 0.20)],
+            None,
+        );
 
-        test_parser("M -.10, -0.20   ", "", &vec![moveto(-0.10, -0.20)], None);
+        test_parser(
+            "M -.10, -0.20   ",
+            "",
+            &vec![moveto(-0.10, -0.20)],
+            None,
+        );
 
-        test_parser("M-.10-0.20", "", &vec![moveto(-0.10, -0.20)], None);
+        test_parser(
+            "M-.10-0.20",
+            "",
+            &vec![moveto(-0.10, -0.20)],
+            None,
+        );
 
-        test_parser("M.10.20", "", &vec![moveto(0.10, 0.20)], None);
+        test_parser(
+            "M.10.20",
+            "",
+            &vec![moveto(0.10, 0.20)],
+            None,
+        );
 
-        test_parser("M .10E1,.20e-4", "", &vec![moveto(1.0, 0.000020)], None);
+        test_parser(
+            "M .10E1,.20e-4",
+            "",
+            &vec![moveto(1.0, 0.000020)],
+            None,
+        );
 
-        test_parser("M-.10E-2,-.20", "", &vec![moveto(-0.0010, -0.20)], None);
+        test_parser(
+            "M-.10E-2,-.20",
+            "",
+            &vec![moveto(-0.0010, -0.20)],
+            None,
+        );
 
-        test_parser("M10.10E2,-0.20e3", "", &vec![moveto(1010.0, -200.0)], None);
+        test_parser(
+            "M10.10E2,-0.20e3",
+            "",
+            &vec![moveto(1010.0, -200.0)],
+            None,
+        );
 
         test_parser(
             "M-10.10E2,-0.20e-3",
@@ -1080,18 +1218,43 @@ mod tests {
 
     #[test]
     fn handles_single_moveto() {
-        test_parser("M 10 20 ", "", &vec![moveto(10.0, 20.0)], None);
+        test_parser(
+            "M 10 20 ",
+            "",
+            &vec![moveto(10.0, 20.0)],
+            None,
+        );
 
-        test_parser("M10,20  ", "", &vec![moveto(10.0, 20.0)], None);
+        test_parser(
+            "M10,20  ",
+            "",
+            &vec![moveto(10.0, 20.0)],
+            None,
+        );
 
-        test_parser("M10 20   ", "", &vec![moveto(10.0, 20.0)], None);
+        test_parser(
+            "M10 20   ",
+            "",
+            &vec![moveto(10.0, 20.0)],
+            None,
+        );
 
-        test_parser("    M10,20     ", "", &vec![moveto(10.0, 20.0)], None);
+        test_parser(
+            "    M10,20     ",
+            "",
+            &vec![moveto(10.0, 20.0)],
+            None,
+        );
     }
 
     #[test]
     fn handles_relative_moveto() {
-        test_parser("m10 20", "", &vec![moveto(10.0, 20.0)], None);
+        test_parser(
+            "m10 20",
+            "",
+            &vec![moveto(10.0, 20.0)],
+            None,
+        );
     }
 
     #[test]
@@ -1515,28 +1678,59 @@ mod tests {
         );
     }
 
-    // FIXME: we don't have a handles_arc() because
-    // we don't know what segments will be computed by PathBuilder::arc().
-    // Maybe we need to represent arcs as native path builder segments,
-    // and only explode them to Cairo curves at rendering time.
     #[test]
     fn first_command_must_be_moveto() {
-        test_parser("  L10 20", "  ^", &vec![], Some(ErrorKind::UnexpectedToken));
+        test_parser(
+            "  L10 20",
+            "  ^",
+            &vec![],
+            Some(ErrorKind::UnexpectedToken),
+        );
     }
 
     #[test]
     fn moveto_args() {
-        test_parser("M", " ^", &vec![], Some(ErrorKind::UnexpectedEof));
+        test_parser(
+            "M",
+            " ^",
+            &vec![],
+            Some(ErrorKind::UnexpectedEof),
+        );
 
-        test_parser("M,", " ^", &vec![], Some(ErrorKind::UnexpectedToken));
+        test_parser(
+            "M,",
+            " ^",
+            &vec![],
+            Some(ErrorKind::UnexpectedToken),
+        );
 
-        test_parser("M10", "   ^", &vec![], Some(ErrorKind::UnexpectedEof));
+        test_parser(
+            "M10",
+            "   ^",
+            &vec![],
+            Some(ErrorKind::UnexpectedEof),
+        );
 
-        test_parser("M10,", "    ^", &vec![], Some(ErrorKind::UnexpectedEof));
+        test_parser(
+            "M10,",
+            "    ^",
+            &vec![],
+            Some(ErrorKind::UnexpectedEof),
+        );
 
-        test_parser("M10x", "   ^", &vec![], Some(ErrorKind::UnexpectedToken));
+        test_parser(
+            "M10x",
+            "   ^",
+            &vec![],
+            Some(ErrorKind::UnexpectedToken),
+        );
 
-        test_parser("M10,x", "    ^", &vec![], Some(ErrorKind::UnexpectedToken));
+        test_parser(
+            "M10,x",
+            "    ^",
+            &vec![],
+            Some(ErrorKind::UnexpectedToken),
+        );
     }
 
     #[test]
@@ -1988,15 +2182,23 @@ mod tests {
             Some(ErrorKind::UnexpectedEof),
         );
 
-        // FIXME: we don't test the arc results, because
-        // we don't know what segments will be computed by PathBuilder::arc().
-        // Maybe we need to represent arcs as native path builder segments,
-        // and only explode them to Cairo curves at rendering time.
+        // FIXME: we need tests for arcs
         //
         // test_parser("M10-20A1 2 3,1,1,6,7,",
         //             "                     ^",
         //             &vec![moveto(10.0, -20.0)
         //                   arc(...)],
         //             Some(ErrorKind::UnexpectedEof));
+    }
+
+    #[test]
+    fn bugs() {
+        // https://gitlab.gnome.org/GNOME/librsvg/issues/345
+        test_parser(
+            "M.. 1,0 0,100000",
+            "  ^",
+            &vec![],
+            Some(ErrorKind::UnexpectedToken),
+        );
     }
 }

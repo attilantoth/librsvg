@@ -9,7 +9,8 @@ use aspect_ratio::*;
 use attributes::Attribute;
 use bbox::*;
 use coord_units::CoordUnits;
-use drawing_ctx::DrawingCtx;
+use drawing_ctx::{DrawingCtx, NodeStack};
+use error::RenderingError;
 use float_eq_cairo::ApproxEqCairo;
 use handle::RsvgHandle;
 use length::*;
@@ -169,7 +170,12 @@ impl NodePattern {
 }
 
 impl NodeTrait for NodePattern {
-    fn set_atts(&self, node: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag) -> NodeResult {
+    fn set_atts(
+        &self,
+        node: &RsvgNode,
+        _: *const RsvgHandle,
+        pbag: &PropertyBag<'_>,
+    ) -> NodeResult {
         // pattern element has overflow:hidden
         // https://www.w3.org/TR/SVG/styling.html#UAStyleSheet
         node.set_overflow_hidden();
@@ -228,17 +234,26 @@ impl NodeTrait for NodePattern {
     }
 }
 
-fn resolve_pattern(pattern: &Pattern, draw_ctx: &mut DrawingCtx) -> Pattern {
+fn resolve_pattern(pattern: &Pattern, draw_ctx: &mut DrawingCtx<'_>) -> Pattern {
     let mut result = pattern.clone();
+
+    let mut stack = NodeStack::new();
 
     while !result.is_resolved() {
         if let Some(acquired) = draw_ctx.get_acquired_node_of_type(
             result.fallback.as_ref().map(String::as_ref),
             NodeType::Pattern,
         ) {
-            acquired
-                .get()
-                .with_impl(|i: &NodePattern| result.resolve_from_fallback(&*i.pattern.borrow()));
+            let node = acquired.get();
+
+            if stack.contains(node) {
+                result.resolve_from_defaults();
+                break; // reference cycle; bail out
+            }
+
+            node.with_impl(|i: &NodePattern| result.resolve_from_fallback(&*i.pattern.borrow()));
+
+            stack.push(node);
         } else {
             result.resolve_from_defaults();
         }
@@ -250,15 +265,15 @@ fn resolve_pattern(pattern: &Pattern, draw_ctx: &mut DrawingCtx) -> Pattern {
 fn set_pattern_on_draw_context(
     pattern: &Pattern,
     values: &ComputedValues,
-    draw_ctx: &mut DrawingCtx,
+    draw_ctx: &mut DrawingCtx<'_>,
     bbox: &BoundingBox,
-) -> bool {
+) -> Result<bool, RenderingError> {
     assert!(pattern.is_resolved());
 
     if pattern.node.is_none() {
         // This means we didn't find any children among the fallbacks,
         // so there is nothing to render.
-        return false;
+        return Ok(false);
     }
 
     let units = pattern.units.unwrap();
@@ -267,18 +282,20 @@ fn set_pattern_on_draw_context(
     let vbox = pattern.vbox.unwrap();
     let preserve_aspect_ratio = pattern.preserve_aspect_ratio.unwrap();
 
-    if units == PatternUnits(CoordUnits::ObjectBoundingBox) {
-        draw_ctx.push_view_box(1.0, 1.0);
-    }
+    let (pattern_x, pattern_y, pattern_width, pattern_height) = {
+        let params = if units == PatternUnits(CoordUnits::ObjectBoundingBox) {
+            draw_ctx.push_view_box(1.0, 1.0)
+        } else {
+            draw_ctx.get_view_params()
+        };
 
-    let pattern_x = pattern.x.unwrap().normalize(values, draw_ctx);
-    let pattern_y = pattern.y.unwrap().normalize(values, draw_ctx);
-    let pattern_width = pattern.width.unwrap().normalize(values, draw_ctx);
-    let pattern_height = pattern.height.unwrap().normalize(values, draw_ctx);
+        let pattern_x = pattern.x.unwrap().normalize(values, &params);
+        let pattern_y = pattern.y.unwrap().normalize(values, &params);
+        let pattern_width = pattern.width.unwrap().normalize(values, &params);
+        let pattern_height = pattern.height.unwrap().normalize(values, &params);
 
-    if units == PatternUnits(CoordUnits::ObjectBoundingBox) {
-        draw_ctx.pop_view_box();
-    }
+        (pattern_x, pattern_y, pattern_width, pattern_height)
+    };
 
     // Work out the size of the rectangle so it takes into account the object bounding box
 
@@ -312,7 +329,7 @@ fn set_pattern_on_draw_context(
     let scaled_height = pattern_height * bbhscale;
 
     if scaled_width.abs() < f64::EPSILON || scaled_height.abs() < f64::EPSILON || pw < 1 || ph < 1 {
-        return false;
+        return Ok(false);
     }
 
     scwscale = f64::from(pw) / scaled_width;
@@ -340,10 +357,8 @@ fn set_pattern_on_draw_context(
 
     let mut caffine: cairo::Matrix;
 
-    let pushed_view_box: bool;
-
     // Create the pattern contents coordinate system
-    if let Some(vbox) = vbox {
+    let _params = if let Some(vbox) = vbox {
         // If there is a vbox, use that
         let (mut x, mut y, w, h) = preserve_aspect_ratio.compute(
             vbox.0.width,
@@ -359,8 +374,7 @@ fn set_pattern_on_draw_context(
 
         caffine = cairo::Matrix::new(w / vbox.0.width, 0.0, 0.0, h / vbox.0.height, x, y);
 
-        draw_ctx.push_view_box(vbox.0.width, vbox.0.height);
-        pushed_view_box = true;
+        draw_ctx.push_view_box(vbox.0.width, vbox.0.height)
     } else if content_units == PatternContentUnits(CoordUnits::ObjectBoundingBox) {
         // If coords are in terms of the bounding box, use them
         let bbrect = bbox.rect.unwrap();
@@ -368,12 +382,11 @@ fn set_pattern_on_draw_context(
         caffine = cairo::Matrix::identity();
         caffine.scale(bbrect.width, bbrect.height);
 
-        draw_ctx.push_view_box(1.0, 1.0);
-        pushed_view_box = true;
+        draw_ctx.push_view_box(1.0, 1.0)
     } else {
         caffine = cairo::Matrix::identity();
-        pushed_view_box = false;
-    }
+        draw_ctx.get_view_params()
+    };
 
     if !scwscale.approx_eq_cairo(&1.0) || !schscale.approx_eq_cairo(&1.0) {
         let mut scalematrix = cairo::Matrix::identity();
@@ -407,17 +420,13 @@ fn set_pattern_on_draw_context(
 
     cr_pattern.set_matrix(caffine);
 
-    draw_ctx.with_discrete_layer(&pattern_node, pattern_values, false, &mut |dc| {
-        pattern_node.draw_children(&pattern_cascaded, dc, false);
+    let res = draw_ctx.with_discrete_layer(&pattern_node, pattern_values, false, &mut |dc| {
+        pattern_node.draw_children(&pattern_cascaded, dc, false)
     });
 
     // Return to the original coordinate system and rendering context
 
     draw_ctx.set_cairo_context(&cr_save);
-
-    if pushed_view_box {
-        draw_ctx.pop_view_box();
-    }
 
     // Set the final surface as a Cairo pattern into the Cairo context
 
@@ -432,15 +441,15 @@ fn set_pattern_on_draw_context(
 
     cr_save.set_source(&surface_pattern);
 
-    true
+    res.and_then(|_| Ok(true))
 }
 
 fn resolve_fallbacks_and_set_pattern(
     pattern: &Pattern,
     values: &ComputedValues,
-    draw_ctx: &mut DrawingCtx,
+    draw_ctx: &mut DrawingCtx<'_>,
     bbox: &BoundingBox,
-) -> bool {
+) -> Result<bool, RenderingError> {
     let resolved = resolve_pattern(pattern, draw_ctx);
 
     set_pattern_on_draw_context(&resolved, values, draw_ctx, bbox)
@@ -448,22 +457,18 @@ fn resolve_fallbacks_and_set_pattern(
 
 pub fn pattern_resolve_fallbacks_and_set_pattern(
     node: &RsvgNode,
-    draw_ctx: &mut DrawingCtx,
+    draw_ctx: &mut DrawingCtx<'_>,
     bbox: &BoundingBox,
-) -> bool {
+) -> Result<bool, RenderingError> {
     assert!(node.get_type() == NodeType::Pattern);
-
-    let mut did_set_pattern = false;
 
     node.with_impl(|node_pattern: &NodePattern| {
         let pattern = &*node_pattern.pattern.borrow();
         let cascaded = node.get_cascaded_values();
         let values = cascaded.get();
 
-        did_set_pattern = resolve_fallbacks_and_set_pattern(pattern, values, draw_ctx, bbox);
-    });
-
-    did_set_pattern
+        resolve_fallbacks_and_set_pattern(pattern, values, draw_ctx, bbox)
+    })
 }
 
 #[cfg(test)]

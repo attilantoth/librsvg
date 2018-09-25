@@ -17,12 +17,12 @@ use state::ComputedValues;
 
 fn render_path_builder(
     builder: &PathBuilder,
-    draw_ctx: &mut DrawingCtx,
+    draw_ctx: &mut DrawingCtx<'_>,
     node: &RsvgNode,
     values: &ComputedValues,
     render_markers: bool,
     clipping: bool,
-) {
+) -> Result<(), RenderingError> {
     draw_ctx.with_discrete_layer(node, values, clipping, &mut |dc| {
         let cr = dc.get_cairo_context();
 
@@ -33,13 +33,17 @@ fn render_path_builder(
             cr.set_fill_rule(cairo::FillRule::from(values.clip_rule));
         } else {
             cr.set_fill_rule(cairo::FillRule::from(values.fill_rule));
-            dc.stroke_and_fill(&cr, values);
+            dc.stroke_and_fill(&cr, values)?;
         }
-    });
+
+        Ok(())
+    })?;
 
     if render_markers {
-        marker::render_markers_for_path_builder(builder, draw_ctx, values, clipping);
+        marker::render_markers_for_path_builder(builder, draw_ctx, values, clipping)?;
     }
+
+    Ok(())
 }
 
 fn render_ellipse(
@@ -47,14 +51,14 @@ fn render_ellipse(
     cy: f64,
     rx: f64,
     ry: f64,
-    draw_ctx: &mut DrawingCtx,
+    draw_ctx: &mut DrawingCtx<'_>,
     node: &RsvgNode,
     values: &ComputedValues,
     clipping: bool,
-) {
+) -> Result<(), RenderingError> {
     // Per the spec, rx and ry must be nonnegative
     if rx <= 0.0 || ry <= 0.0 {
-        return;
+        return Ok(());
     }
 
     // 4/3 * (1-cos 45°)/sin 45° = 4/3 * sqrt(2) - 1
@@ -103,7 +107,7 @@ fn render_ellipse(
 
     builder.close_path();
 
-    render_path_builder(&builder, draw_ctx, node, values, false, clipping);
+    render_path_builder(&builder, draw_ctx, node, values, false, clipping)
 }
 
 pub struct NodePath {
@@ -119,7 +123,7 @@ impl NodePath {
 }
 
 impl NodeTrait for NodePath {
-    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag) -> NodeResult {
+    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag<'_>) -> NodeResult {
         for (_key, attr, value) in pbag.iter() {
             if attr == Attribute::D {
                 let mut builder = PathBuilder::new();
@@ -139,15 +143,17 @@ impl NodeTrait for NodePath {
     fn draw(
         &self,
         node: &RsvgNode,
-        cascaded: &CascadedValues,
-        draw_ctx: &mut DrawingCtx,
+        cascaded: &CascadedValues<'_>,
+        draw_ctx: &mut DrawingCtx<'_>,
         clipping: bool,
-    ) {
+    ) -> Result<(), RenderingError> {
         let values = cascaded.get();
 
         if let Some(ref builder) = *self.builder.borrow() {
-            render_path_builder(builder, draw_ctx, node, values, true, clipping);
+            render_path_builder(builder, draw_ctx, node, values, true, clipping)?;
         }
+
+        Ok(())
     }
 }
 
@@ -179,7 +185,7 @@ impl NodePoly {
 }
 
 impl NodeTrait for NodePoly {
-    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag) -> NodeResult {
+    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag<'_>) -> NodeResult {
         for (_key, attr, value) in pbag.iter() {
             // support for svg < 1.0 which used verts
             if attr == Attribute::Points || attr == Attribute::Verts {
@@ -192,7 +198,7 @@ impl NodeTrait for NodePoly {
                     }
 
                     Err(e) => {
-                        return Err(NodeError::parse_error(attr, e));
+                        return Err(NodeError::attribute_error(attr, e));
                     }
                 }
             }
@@ -204,10 +210,10 @@ impl NodeTrait for NodePoly {
     fn draw(
         &self,
         node: &RsvgNode,
-        cascaded: &CascadedValues,
-        draw_ctx: &mut DrawingCtx,
+        cascaded: &CascadedValues<'_>,
+        draw_ctx: &mut DrawingCtx<'_>,
         clipping: bool,
-    ) {
+    ) -> Result<(), RenderingError> {
         let values = cascaded.get();
 
         if let Some(ref points) = *self.points.borrow() {
@@ -225,8 +231,10 @@ impl NodeTrait for NodePoly {
                 builder.close_path();
             }
 
-            render_path_builder(&builder, draw_ctx, node, values, true, clipping);
+            render_path_builder(&builder, draw_ctx, node, values, true, clipping)?;
         }
+
+        Ok(())
     }
 }
 
@@ -249,7 +257,7 @@ impl NodeLine {
 }
 
 impl NodeTrait for NodeLine {
-    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag) -> NodeResult {
+    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag<'_>) -> NodeResult {
         for (_key, attr, value) in pbag.iter() {
             match attr {
                 Attribute::X1 => self.x1.set(parse("x1", value, LengthDir::Horizontal)?),
@@ -266,23 +274,25 @@ impl NodeTrait for NodeLine {
     fn draw(
         &self,
         node: &RsvgNode,
-        cascaded: &CascadedValues,
-        draw_ctx: &mut DrawingCtx,
+        cascaded: &CascadedValues<'_>,
+        draw_ctx: &mut DrawingCtx<'_>,
         clipping: bool,
-    ) {
+    ) -> Result<(), RenderingError> {
         let values = cascaded.get();
 
         let mut builder = PathBuilder::new();
 
-        let x1 = self.x1.get().normalize(values, draw_ctx);
-        let y1 = self.y1.get().normalize(values, draw_ctx);
-        let x2 = self.x2.get().normalize(values, draw_ctx);
-        let y2 = self.y2.get().normalize(values, draw_ctx);
+        let params = draw_ctx.get_view_params();
+
+        let x1 = self.x1.get().normalize(values, &params);
+        let y1 = self.y1.get().normalize(values, &params);
+        let x2 = self.x2.get().normalize(values, &params);
+        let y2 = self.y2.get().normalize(values, &params);
 
         builder.move_to(x1, y1);
         builder.line_to(x2, y2);
 
-        render_path_builder(&builder, draw_ctx, node, values, true, clipping);
+        render_path_builder(&builder, draw_ctx, node, values, true, clipping)
     }
 }
 
@@ -313,7 +323,7 @@ impl NodeRect {
 }
 
 impl NodeTrait for NodeRect {
-    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag) -> NodeResult {
+    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag<'_>) -> NodeResult {
         for (_key, attr, value) in pbag.iter() {
             match attr {
                 Attribute::X => self.x.set(parse("x", value, LengthDir::Horizontal)?),
@@ -354,17 +364,18 @@ impl NodeTrait for NodeRect {
     fn draw(
         &self,
         node: &RsvgNode,
-        cascaded: &CascadedValues,
-        draw_ctx: &mut DrawingCtx,
+        cascaded: &CascadedValues<'_>,
+        draw_ctx: &mut DrawingCtx<'_>,
         clipping: bool,
-    ) {
+    ) -> Result<(), RenderingError> {
         let values = cascaded.get();
 
-        let x = self.x.get().normalize(values, draw_ctx);
-        let y = self.y.get().normalize(values, draw_ctx);
+        let params = draw_ctx.get_view_params();
 
-        let w = self.w.get().normalize(values, draw_ctx);
-        let h = self.h.get().normalize(values, draw_ctx);
+        let x = self.x.get().normalize(values, &params);
+        let y = self.y.get().normalize(values, &params);
+        let w = self.w.get().normalize(values, &params);
+        let h = self.h.get().normalize(values, &params);
 
         let mut rx;
         let mut ry;
@@ -376,29 +387,29 @@ impl NodeTrait for NodeRect {
             }
 
             (Some(_rx), None) => {
-                rx = _rx.normalize(values, draw_ctx);
-                ry = _rx.normalize(values, draw_ctx);
+                rx = _rx.normalize(values, &params);
+                ry = _rx.normalize(values, &params);
             }
 
             (None, Some(_ry)) => {
-                rx = _ry.normalize(values, draw_ctx);
-                ry = _ry.normalize(values, draw_ctx);
+                rx = _ry.normalize(values, &params);
+                ry = _ry.normalize(values, &params);
             }
 
             (Some(_rx), Some(_ry)) => {
-                rx = _rx.normalize(values, draw_ctx);
-                ry = _ry.normalize(values, draw_ctx);
+                rx = _rx.normalize(values, &params);
+                ry = _ry.normalize(values, &params);
             }
         }
 
         // Per the spec, w,h must be >= 0
         if w <= 0.0 || h <= 0.0 {
-            return;
+            return Ok(());
         }
 
         // ... and rx,ry must be nonnegative
         if rx < 0.0 || ry < 0.0 {
-            return;
+            return Ok(());
         }
 
         let half_w = w / 2.0;
@@ -494,7 +505,7 @@ impl NodeTrait for NodeRect {
             builder.close_path ();
         }
 
-        render_path_builder(&builder, draw_ctx, node, values, false, clipping);
+        render_path_builder(&builder, draw_ctx, node, values, false, clipping)
     }
 }
 
@@ -515,7 +526,7 @@ impl NodeCircle {
 }
 
 impl NodeTrait for NodeCircle {
-    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag) -> NodeResult {
+    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag<'_>) -> NodeResult {
         for (_key, attr, value) in pbag.iter() {
             match attr {
                 Attribute::Cx => self.cx.set(parse("cx", value, LengthDir::Horizontal)?),
@@ -537,17 +548,19 @@ impl NodeTrait for NodeCircle {
     fn draw(
         &self,
         node: &RsvgNode,
-        cascaded: &CascadedValues,
-        draw_ctx: &mut DrawingCtx,
+        cascaded: &CascadedValues<'_>,
+        draw_ctx: &mut DrawingCtx<'_>,
         clipping: bool,
-    ) {
+    ) -> Result<(), RenderingError> {
         let values = cascaded.get();
 
-        let cx = self.cx.get().normalize(values, draw_ctx);
-        let cy = self.cy.get().normalize(values, draw_ctx);
-        let r = self.r.get().normalize(values, draw_ctx);
+        let params = draw_ctx.get_view_params();
 
-        render_ellipse(cx, cy, r, r, draw_ctx, node, values, clipping);
+        let cx = self.cx.get().normalize(values, &params);
+        let cy = self.cy.get().normalize(values, &params);
+        let r = self.r.get().normalize(values, &params);
+
+        render_ellipse(cx, cy, r, r, draw_ctx, node, values, clipping)
     }
 }
 
@@ -570,7 +583,7 @@ impl NodeEllipse {
 }
 
 impl NodeTrait for NodeEllipse {
-    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag) -> NodeResult {
+    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag<'_>) -> NodeResult {
         for (_key, attr, value) in pbag.iter() {
             match attr {
                 Attribute::Cx => self.cx.set(parse("cx", value, LengthDir::Horizontal)?),
@@ -599,17 +612,19 @@ impl NodeTrait for NodeEllipse {
     fn draw(
         &self,
         node: &RsvgNode,
-        cascaded: &CascadedValues,
-        draw_ctx: &mut DrawingCtx,
+        cascaded: &CascadedValues<'_>,
+        draw_ctx: &mut DrawingCtx<'_>,
         clipping: bool,
-    ) {
+    ) -> Result<(), RenderingError> {
         let values = cascaded.get();
 
-        let cx = self.cx.get().normalize(values, draw_ctx);
-        let cy = self.cy.get().normalize(values, draw_ctx);
-        let rx = self.rx.get().normalize(values, draw_ctx);
-        let ry = self.ry.get().normalize(values, draw_ctx);
+        let params = draw_ctx.get_view_params();
 
-        render_ellipse(cx, cy, rx, ry, draw_ctx, node, values, clipping);
+        let cx = self.cx.get().normalize(values, &params);
+        let cy = self.cy.get().normalize(values, &params);
+        let rx = self.rx.get().normalize(values, &params);
+        let ry = self.ry.get().normalize(values, &params);
+
+        render_ellipse(cx, cy, rx, ry, draw_ctx, node, values, clipping)
     }
 }

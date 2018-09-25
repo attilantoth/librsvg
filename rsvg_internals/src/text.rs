@@ -6,6 +6,8 @@ use std::str;
 
 use attributes::Attribute;
 use drawing_ctx::DrawingCtx;
+use error::RenderingError;
+use font_props::FontWeightSpec;
 use handle::RsvgHandle;
 use length::*;
 use node::{boxed_node_new, CascadedValues, NodeResult, NodeTrait, NodeType, RsvgNode};
@@ -18,7 +20,6 @@ use state::{
     FontStretch,
     FontStyle,
     FontVariant,
-    FontWeight,
     TextAnchor,
     UnicodeBidi,
     WritingMode,
@@ -66,7 +67,7 @@ impl NodeChars {
         &self,
         _node: &RsvgNode,
         values: &ComputedValues,
-        draw_ctx: &DrawingCtx,
+        draw_ctx: &DrawingCtx<'_>,
         length: &mut f64,
     ) {
         let s = self.string.borrow();
@@ -80,30 +81,35 @@ impl NodeChars {
         &self,
         _node: &RsvgNode,
         values: &ComputedValues,
-        draw_ctx: &mut DrawingCtx,
+        draw_ctx: &mut DrawingCtx<'_>,
         x: &mut f64,
         y: &mut f64,
         clipping: bool,
-    ) {
+    ) -> Result<(), RenderingError> {
         let s = self.string.borrow();
         let layout = create_pango_layout(draw_ctx, values, &s);
         let (width, _) = layout.get_size();
 
         let baseline = f64::from(layout.get_baseline()) / f64::from(pango::SCALE);
-        let offset = baseline + values.baseline_shift.0.normalize(values, draw_ctx);
+        let offset = baseline + values
+            .baseline_shift
+            .0
+            .normalize(values, &draw_ctx.get_view_params());
 
         if values.text_gravity_is_vertical() {
-            draw_ctx.draw_pango_layout(&layout, values, *x + offset, *y, clipping);
+            draw_ctx.draw_pango_layout(&layout, values, *x + offset, *y, clipping)?;
             *y += f64::from(width) / f64::from(pango::SCALE);
         } else {
-            draw_ctx.draw_pango_layout(&layout, values, *x, *y - offset, clipping);
+            draw_ctx.draw_pango_layout(&layout, values, *x, *y - offset, clipping)?;
             *x += f64::from(width) / f64::from(pango::SCALE);
         }
+
+        Ok(())
     }
 }
 
 impl NodeTrait for NodeChars {
-    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, _: &PropertyBag) -> NodeResult {
+    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, _: &PropertyBag<'_>) -> NodeResult {
         Ok(())
     }
 }
@@ -127,7 +133,7 @@ impl NodeText {
 }
 
 impl NodeTrait for NodeText {
-    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag) -> NodeResult {
+    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag<'_>) -> NodeResult {
         for (_key, attr, value) in pbag.iter() {
             match attr {
                 Attribute::X => self.x.set(parse("x", value, LengthDir::Horizontal)?),
@@ -148,16 +154,18 @@ impl NodeTrait for NodeText {
     fn draw(
         &self,
         node: &RsvgNode,
-        cascaded: &CascadedValues,
-        draw_ctx: &mut DrawingCtx,
+        cascaded: &CascadedValues<'_>,
+        draw_ctx: &mut DrawingCtx<'_>,
         clipping: bool,
-    ) {
+    ) -> Result<(), RenderingError> {
         let values = cascaded.get();
 
-        let mut x = self.x.get().normalize(values, draw_ctx);
-        let mut y = self.y.get().normalize(values, draw_ctx);
-        let mut dx = self.dx.get().normalize(values, draw_ctx);
-        let mut dy = self.dy.get().normalize(values, draw_ctx);
+        let params = draw_ctx.get_view_params();
+
+        let mut x = self.x.get().normalize(values, &params);
+        let mut y = self.y.get().normalize(values, &params);
+        let mut dx = self.dx.get().normalize(values, &params);
+        let mut dy = self.dy.get().normalize(values, &params);
 
         let anchor = values.text_anchor;
 
@@ -182,7 +190,7 @@ impl NodeTrait for NodeText {
         x += dx;
         y += dy;
 
-        render_children(node, cascaded, draw_ctx, &mut x, &mut y, false, clipping);
+        render_children(node, cascaded, draw_ctx, &mut x, &mut y, false, clipping)
     }
 }
 
@@ -200,8 +208,8 @@ impl NodeTRef {
     fn measure(
         &self,
         _node: &RsvgNode,
-        cascaded: &CascadedValues,
-        draw_ctx: &mut DrawingCtx,
+        cascaded: &CascadedValues<'_>,
+        draw_ctx: &mut DrawingCtx<'_>,
         length: &mut f64,
     ) -> bool {
         let l = self.link.borrow();
@@ -223,27 +231,29 @@ impl NodeTRef {
     fn render(
         &self,
         _node: &RsvgNode,
-        cascaded: &CascadedValues,
-        draw_ctx: &mut DrawingCtx,
+        cascaded: &CascadedValues<'_>,
+        draw_ctx: &mut DrawingCtx<'_>,
         x: &mut f64,
         y: &mut f64,
         clipping: bool,
-    ) {
+    ) -> Result<(), RenderingError> {
         let l = self.link.borrow();
 
         if l.is_none() {
-            return;
+            return Ok(());
         }
 
         if let Some(acquired) = draw_ctx.get_acquired_node(l.as_ref().unwrap()) {
             let c = acquired.get();
-            render_children(&c, cascaded, draw_ctx, x, y, true, clipping)
+            render_children(&c, cascaded, draw_ctx, x, y, true, clipping)?;
         }
+
+        Ok(())
     }
 }
 
 impl NodeTrait for NodeTRef {
-    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag) -> NodeResult {
+    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag<'_>) -> NodeResult {
         for (_key, attr, value) in pbag.iter() {
             match attr {
                 Attribute::XlinkHref => *self.link.borrow_mut() = Some(value.to_owned()),
@@ -275,8 +285,8 @@ impl NodeTSpan {
     fn measure(
         &self,
         node: &RsvgNode,
-        cascaded: &CascadedValues,
-        draw_ctx: &mut DrawingCtx,
+        cascaded: &CascadedValues<'_>,
+        draw_ctx: &mut DrawingCtx<'_>,
         length: &mut f64,
         usetextonly: bool,
     ) -> bool {
@@ -286,10 +296,12 @@ impl NodeTSpan {
             return true;
         }
 
+        let params = draw_ctx.get_view_params();
+
         if values.text_gravity_is_vertical() {
-            *length += self.dy.get().normalize(values, draw_ctx);
+            *length += self.dy.get().normalize(values, &params);
         } else {
-            *length += self.dx.get().normalize(values, draw_ctx);
+            *length += self.dx.get().normalize(values, &params);
         }
 
         measure_children(node, cascaded, draw_ctx, length, usetextonly)
@@ -298,17 +310,19 @@ impl NodeTSpan {
     fn render(
         &self,
         node: &RsvgNode,
-        cascaded: &CascadedValues,
-        draw_ctx: &mut DrawingCtx,
+        cascaded: &CascadedValues<'_>,
+        draw_ctx: &mut DrawingCtx<'_>,
         x: &mut f64,
         y: &mut f64,
         usetextonly: bool,
         clipping: bool,
-    ) {
+    ) -> Result<(), RenderingError> {
         let values = cascaded.get();
 
-        let mut dx = self.dx.get().normalize(values, draw_ctx);
-        let mut dy = self.dy.get().normalize(values, draw_ctx);
+        let params = draw_ctx.get_view_params();
+
+        let mut dx = self.dx.get().normalize(values, &params);
+        let mut dy = self.dy.get().normalize(values, &params);
 
         let vertical = values.text_gravity_is_vertical();
         let anchor = values.text_anchor;
@@ -316,7 +330,7 @@ impl NodeTSpan {
         let offset = anchor_offset(node, cascaded, draw_ctx, anchor, usetextonly);
 
         if let Some(self_x) = self.x.get() {
-            *x = self_x.normalize(values, draw_ctx);
+            *x = self_x.normalize(values, &params);
             if !vertical {
                 *x -= offset;
                 dx = match anchor {
@@ -329,7 +343,7 @@ impl NodeTSpan {
         *x += dx;
 
         if let Some(self_y) = self.y.get() {
-            *y = self_y.normalize(values, draw_ctx);
+            *y = self_y.normalize(values, &params);
             if vertical {
                 *y -= offset;
                 dy = match anchor {
@@ -341,12 +355,12 @@ impl NodeTSpan {
         }
         *y += dy;
 
-        render_children(node, cascaded, draw_ctx, x, y, usetextonly, clipping);
+        render_children(node, cascaded, draw_ctx, x, y, usetextonly, clipping)
     }
 }
 
 impl NodeTrait for NodeTSpan {
-    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag) -> NodeResult {
+    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag<'_>) -> NodeResult {
         for (_key, attr, value) in pbag.iter() {
             match attr {
                 Attribute::X => self
@@ -410,22 +424,22 @@ impl From<FontStretch> for pango::Stretch {
     }
 }
 
-impl From<FontWeight> for pango::Weight {
-    fn from(w: FontWeight) -> pango::Weight {
+impl From<FontWeightSpec> for pango::Weight {
+    fn from(w: FontWeightSpec) -> pango::Weight {
         match w {
-            FontWeight::Normal => pango::Weight::Normal,
-            FontWeight::Bold => pango::Weight::Bold,
-            FontWeight::Bolder => pango::Weight::Ultrabold,
-            FontWeight::Lighter => pango::Weight::Light,
-            FontWeight::W100 => pango::Weight::Thin,
-            FontWeight::W200 => pango::Weight::Ultralight,
-            FontWeight::W300 => pango::Weight::Semilight,
-            FontWeight::W400 => pango::Weight::Normal,
-            FontWeight::W500 => pango::Weight::Medium,
-            FontWeight::W600 => pango::Weight::Semibold,
-            FontWeight::W700 => pango::Weight::Bold,
-            FontWeight::W800 => pango::Weight::Ultrabold,
-            FontWeight::W900 => pango::Weight::Heavy,
+            FontWeightSpec::Normal => pango::Weight::Normal,
+            FontWeightSpec::Bold => pango::Weight::Bold,
+            FontWeightSpec::Bolder => pango::Weight::Ultrabold,
+            FontWeightSpec::Lighter => pango::Weight::Light,
+            FontWeightSpec::W100 => pango::Weight::Thin,
+            FontWeightSpec::W200 => pango::Weight::Ultralight,
+            FontWeightSpec::W300 => pango::Weight::Semilight,
+            FontWeightSpec::W400 => pango::Weight::Normal,
+            FontWeightSpec::W500 => pango::Weight::Medium,
+            FontWeightSpec::W600 => pango::Weight::Semibold,
+            FontWeightSpec::W700 => pango::Weight::Bold,
+            FontWeightSpec::W800 => pango::Weight::Ultrabold,
+            FontWeightSpec::W900 => pango::Weight::Heavy,
         }
     }
 }
@@ -471,7 +485,7 @@ impl From<WritingMode> for pango::Gravity {
 }
 
 fn create_pango_layout(
-    draw_ctx: &DrawingCtx,
+    draw_ctx: &DrawingCtx<'_>,
     values: &ComputedValues,
     text: &str,
 ) -> pango::Layout {
@@ -503,18 +517,20 @@ fn create_pango_layout(
 
     let mut font_desc = pango_context.get_font_description().unwrap();
 
-    font_desc.set_family(&values.font_family.0);
+    font_desc.set_family(&(values.font_family.0).0);
 
     font_desc.set_style(pango::Style::from(values.font_style));
 
     font_desc.set_variant(pango::Variant::from(values.font_variant));
 
-    font_desc.set_weight(pango::Weight::from(values.font_weight));
+    font_desc.set_weight(pango::Weight::from(values.font_weight.0));
 
     font_desc.set_stretch(pango::Stretch::from(values.font_stretch));
 
+    let params = draw_ctx.get_view_params();
+
     font_desc.set_size(to_pango_units(
-        values.font_size.0.normalize(values, draw_ctx),
+        values.font_size.0.normalize(values, &params),
     ));
 
     let layout = pango::Layout::new(&pango_context);
@@ -524,7 +540,7 @@ fn create_pango_layout(
 
     attr_list.insert(
         pango::Attribute::new_letter_spacing(to_pango_units(
-            values.letter_spacing.0.normalize(values, draw_ctx),
+            values.letter_spacing.0.normalize(values, &params),
         )).unwrap(),
     );
 
@@ -548,8 +564,8 @@ fn create_pango_layout(
 
 fn anchor_offset(
     node: &RsvgNode,
-    cascaded: &CascadedValues,
-    draw_ctx: &mut DrawingCtx,
+    cascaded: &CascadedValues<'_>,
+    draw_ctx: &mut DrawingCtx<'_>,
     anchor: TextAnchor,
     textonly: bool,
 ) -> f64 {
@@ -571,8 +587,8 @@ fn anchor_offset(
 
 fn measure_children(
     node: &RsvgNode,
-    cascaded: &CascadedValues,
-    draw_ctx: &mut DrawingCtx,
+    cascaded: &CascadedValues<'_>,
+    draw_ctx: &mut DrawingCtx<'_>,
     length: &mut f64,
     textonly: bool,
 ) -> bool {
@@ -596,8 +612,8 @@ fn measure_children(
 
 fn measure_child(
     node: &RsvgNode,
-    cascaded: &CascadedValues,
-    draw_ctx: &mut DrawingCtx,
+    cascaded: &CascadedValues<'_>,
+    draw_ctx: &mut DrawingCtx<'_>,
     length: &mut f64,
     textonly: bool,
 ) -> bool {
@@ -653,31 +669,33 @@ fn measure_child(
 
 fn render_children(
     node: &RsvgNode,
-    cascaded: &CascadedValues,
-    draw_ctx: &mut DrawingCtx,
+    cascaded: &CascadedValues<'_>,
+    draw_ctx: &mut DrawingCtx<'_>,
     x: &mut f64,
     y: &mut f64,
     textonly: bool,
     clipping: bool,
-) {
+) -> Result<(), RenderingError> {
     let values = cascaded.get();
 
     draw_ctx.with_discrete_layer(node, values, clipping, &mut |dc| {
         for child in node.children() {
-            render_child(&child, cascaded, dc, x, y, textonly, clipping);
+            render_child(&child, cascaded, dc, x, y, textonly, clipping)?;
         }
-    });
+
+        Ok(())
+    })
 }
 
 fn render_child(
     node: &RsvgNode,
-    cascaded: &CascadedValues,
-    draw_ctx: &mut DrawingCtx,
+    cascaded: &CascadedValues<'_>,
+    draw_ctx: &mut DrawingCtx<'_>,
     x: &mut f64,
     y: &mut f64,
     textonly: bool,
     clipping: bool,
-) {
+) -> Result<(), RenderingError> {
     let values = cascaded.get();
 
     let cr = draw_ctx.get_cairo_context();
@@ -685,7 +703,7 @@ fn render_child(
 
     cr.transform(node.get_transform());
 
-    match (node.get_type(), textonly) {
+    let res = match (node.get_type(), textonly) {
         (NodeType::Chars, _) => {
             node.with_impl(|chars: &NodeChars| {
                 // here we use the values from the current element,
@@ -693,10 +711,19 @@ fn render_child(
                 // represent a real SVG element - it is just our container
                 // for character data.
                 chars.render(node, values, draw_ctx, x, y, clipping)
-            });
+            })
         }
-        (_, true) => {
-            render_children(
+        (_, true) => render_children(
+            node,
+            &CascadedValues::new(cascaded, node),
+            draw_ctx,
+            x,
+            y,
+            textonly,
+            clipping,
+        ),
+        (NodeType::TSpan, _) => node.with_impl(|tspan: &NodeTSpan| {
+            tspan.render(
                 node,
                 &CascadedValues::new(cascaded, node),
                 draw_ctx,
@@ -704,37 +731,24 @@ fn render_child(
                 y,
                 textonly,
                 clipping,
-            );
-        }
-        (NodeType::TSpan, _) => {
-            node.with_impl(|tspan: &NodeTSpan| {
-                tspan.render(
-                    node,
-                    &CascadedValues::new(cascaded, node),
-                    draw_ctx,
-                    x,
-                    y,
-                    textonly,
-                    clipping,
-                );
-            });
-        }
-        (NodeType::TRef, _) => {
-            node.with_impl(|tref: &NodeTRef| {
-                tref.render(
-                    node,
-                    &CascadedValues::new(cascaded, node),
-                    draw_ctx,
-                    x,
-                    y,
-                    clipping,
-                );
-            });
-        }
-        (_, _) => {}
-    }
+            )
+        }),
+        (NodeType::TRef, _) => node.with_impl(|tref: &NodeTRef| {
+            tref.render(
+                node,
+                &CascadedValues::new(cascaded, node),
+                draw_ctx,
+                x,
+                y,
+                clipping,
+            )
+        }),
+        (_, _) => Ok(()),
+    };
 
     cr.restore();
+
+    res
 }
 
 #[no_mangle]
@@ -742,6 +756,7 @@ pub extern "C" fn rsvg_node_chars_new(raw_parent: *const RsvgNode) -> *const Rsv
     boxed_node_new(
         NodeType::Chars,
         raw_parent,
+        "rsvg_chars",
         None,
         None,
         Box::new(NodeChars::new()),
@@ -757,6 +772,7 @@ pub extern "C" fn rsvg_node_chars_append(
     assert!(!raw_node.is_null());
     let node: &RsvgNode = unsafe { &*raw_node };
 
+    assert!(node.get_type() == NodeType::Chars);
     assert!(!text.is_null());
     assert!(len >= 0);
 

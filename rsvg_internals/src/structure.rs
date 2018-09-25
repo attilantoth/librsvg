@@ -7,6 +7,7 @@ use glib_sys;
 use aspect_ratio::*;
 use attributes::Attribute;
 use drawing_ctx::DrawingCtx;
+use error::RenderingError;
 use float_eq_cairo::ApproxEqCairo;
 use handle::RsvgHandle;
 use length::*;
@@ -14,7 +15,7 @@ use libc;
 use node::*;
 use parsers::{parse, parse_and_validate, Parse};
 use property_bag::{OwnedPropertyBag, PropertyBag};
-use state::{self, Overflow};
+use state::Overflow;
 use viewbox::*;
 use viewport::{draw_in_viewport, ClipMode};
 
@@ -27,22 +28,22 @@ impl NodeGroup {
 }
 
 impl NodeTrait for NodeGroup {
-    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, _: &PropertyBag) -> NodeResult {
+    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, _: &PropertyBag<'_>) -> NodeResult {
         Ok(())
     }
 
     fn draw(
         &self,
         node: &RsvgNode,
-        cascaded: &CascadedValues,
-        draw_ctx: &mut DrawingCtx,
+        cascaded: &CascadedValues<'_>,
+        draw_ctx: &mut DrawingCtx<'_>,
         clipping: bool,
-    ) {
+    ) -> Result<(), RenderingError> {
         let values = cascaded.get();
 
         draw_ctx.with_discrete_layer(node, values, clipping, &mut |dc| {
-            node.draw_children(cascaded, dc, clipping);
-        });
+            node.draw_children(cascaded, dc, clipping)
+        })
     }
 }
 
@@ -55,7 +56,7 @@ impl NodeDefs {
 }
 
 impl NodeTrait for NodeDefs {
-    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, _: &PropertyBag) -> NodeResult {
+    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, _: &PropertyBag<'_>) -> NodeResult {
         Ok(())
     }
 }
@@ -69,24 +70,26 @@ impl NodeSwitch {
 }
 
 impl NodeTrait for NodeSwitch {
-    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, _: &PropertyBag) -> NodeResult {
+    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, _: &PropertyBag<'_>) -> NodeResult {
         Ok(())
     }
 
     fn draw(
         &self,
         node: &RsvgNode,
-        cascaded: &CascadedValues,
-        draw_ctx: &mut DrawingCtx,
+        cascaded: &CascadedValues<'_>,
+        draw_ctx: &mut DrawingCtx<'_>,
         clipping: bool,
-    ) {
+    ) -> Result<(), RenderingError> {
         let values = cascaded.get();
 
         draw_ctx.with_discrete_layer(node, values, clipping, &mut |dc| {
             if let Some(child) = node.children().find(|c| c.get_cond()) {
-                dc.draw_node_from_stack(&CascadedValues::new(cascaded, &child), &child, clipping);
+                dc.draw_node_from_stack(&CascadedValues::new(cascaded, &child), &child, clipping)
+            } else {
+                Ok(())
             }
-        });
+        })
     }
 }
 
@@ -112,10 +115,22 @@ impl NodeSvg {
             pbag: RefCell::new(None),
         }
     }
+
+    pub fn set_delayed_style(&self, node: &RsvgNode, handle: *const RsvgHandle) {
+        if let Some(owned_pbag) = self.pbag.borrow().as_ref() {
+            let pbag = PropertyBag::from_owned(owned_pbag);
+            node.set_style(handle, &pbag);
+        }
+    }
 }
 
 impl NodeTrait for NodeSvg {
-    fn set_atts(&self, node: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag) -> NodeResult {
+    fn set_atts(
+        &self,
+        node: &RsvgNode,
+        _: *const RsvgHandle,
+        pbag: &PropertyBag<'_>,
+    ) -> NodeResult {
         // SVG element has overflow:hidden
         // https://www.w3.org/TR/SVG/styling.html#UAStyleSheet
         node.set_overflow_hidden();
@@ -173,16 +188,18 @@ impl NodeTrait for NodeSvg {
     fn draw(
         &self,
         node: &RsvgNode,
-        cascaded: &CascadedValues,
-        draw_ctx: &mut DrawingCtx,
+        cascaded: &CascadedValues<'_>,
+        draw_ctx: &mut DrawingCtx<'_>,
         clipping: bool,
-    ) {
+    ) -> Result<(), RenderingError> {
         let values = cascaded.get();
 
-        let nx = self.x.get().normalize(values, draw_ctx);
-        let ny = self.y.get().normalize(values, draw_ctx);
-        let nw = self.w.get().normalize(values, draw_ctx);
-        let nh = self.h.get().normalize(values, draw_ctx);
+        let params = draw_ctx.get_view_params();
+
+        let nx = self.x.get().normalize(values, &params);
+        let ny = self.y.get().normalize(values, &params);
+        let nw = self.w.get().normalize(values, &params);
+        let nh = self.h.get().normalize(values, &params);
 
         let do_clip = !values.is_overflow() && node.get_parent().is_some();
 
@@ -202,9 +219,9 @@ impl NodeTrait for NodeSvg {
             clipping,
             &mut |dc| {
                 // we don't push a layer because draw_in_viewport() already does it
-                node.draw_children(cascaded, dc, clipping);
+                node.draw_children(cascaded, dc, clipping)
             },
-        );
+        )
     }
 }
 
@@ -229,7 +246,7 @@ impl NodeUse {
 }
 
 impl NodeTrait for NodeUse {
-    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag) -> NodeResult {
+    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag<'_>) -> NodeResult {
         for (_key, attr, value) in pbag.iter() {
             match attr {
                 Attribute::XlinkHref => *self.link.borrow_mut() = Some(value.to_owned()),
@@ -264,33 +281,38 @@ impl NodeTrait for NodeUse {
     fn draw(
         &self,
         node: &RsvgNode,
-        cascaded: &CascadedValues,
-        draw_ctx: &mut DrawingCtx,
+        cascaded: &CascadedValues<'_>,
+        draw_ctx: &mut DrawingCtx<'_>,
         clipping: bool,
-    ) {
+    ) -> Result<(), RenderingError> {
         let values = cascaded.get();
 
         let link = self.link.borrow();
 
         if link.is_none() {
-            return;
+            return Ok(());
         }
 
-        let acquired = draw_ctx.get_acquired_node(link.as_ref().unwrap());
-
-        let child = if let Some(acquired) = acquired {
-            acquired.get()
+        let child = if let Some(acquired) = draw_ctx.get_acquired_node(link.as_ref().unwrap()) {
+            // Here we clone the acquired child, so that we can drop the AcquiredNode as
+            // early as possible.  This is so that the child's drawing method will be able
+            // to re-acquire the child for other purposes.
+            acquired.get().clone()
         } else {
-            return;
+            return Ok(());
         };
 
-        if Node::is_ancestor(node.clone(), child.clone()) {
+        if Node::is_ancestor(child.clone(), node.clone()) {
             // or, if we're <use>'ing ourselves
-            return;
+            return Err(RenderingError::CircularReference);
         }
 
-        let nx = self.x.get().normalize(values, draw_ctx);
-        let ny = self.y.get().normalize(values, draw_ctx);
+        draw_ctx.increase_num_elements_rendered_through_use(1);
+
+        let params = draw_ctx.get_view_params();
+
+        let nx = self.x.get().normalize(values, &params);
+        let ny = self.y.get().normalize(values, &params);
 
         // If attributes ‘width’ and/or ‘height’ are not specified,
         // [...] use values of '100%' for these attributes.
@@ -301,17 +323,17 @@ impl NodeTrait for NodeUse {
             .w
             .get()
             .unwrap_or_else(|| Length::parse_str("100%", LengthDir::Horizontal).unwrap())
-            .normalize(values, draw_ctx);
+            .normalize(values, &params);
         let nh = self
             .h
             .get()
             .unwrap_or_else(|| Length::parse_str("100%", LengthDir::Vertical).unwrap())
-            .normalize(values, draw_ctx);
+            .normalize(values, &params);
 
         // width or height set to 0 disables rendering of the element
         // https://www.w3.org/TR/SVG/struct.html#UseElementWidthAttribute
         if nw.approx_eq_cairo(&0.0) || nh.approx_eq_cairo(&0.0) {
-            return;
+            return Ok(());
         }
 
         if child.get_type() != NodeType::Symbol {
@@ -323,13 +345,12 @@ impl NodeTrait for NodeUse {
                     &CascadedValues::new_from_values(&child, values),
                     &child,
                     clipping,
-                );
-            });
+                )
+            })
         } else {
             child.with_impl(|symbol: &NodeSymbol| {
                 let do_clip = !values.is_overflow()
-                    || (values.overflow == Overflow::Visible
-                        && child.get_specified_values().is_overflow());
+                    || (values.overflow == Overflow::Visible && child.is_overflow());
 
                 draw_in_viewport(
                     nx,
@@ -351,10 +372,10 @@ impl NodeTrait for NodeUse {
                             &CascadedValues::new_from_values(&child, values),
                             dc,
                             clipping,
-                        );
+                        )
                     },
-                );
-            });
+                )
+            })
         }
     }
 }
@@ -374,7 +395,12 @@ impl NodeSymbol {
 }
 
 impl NodeTrait for NodeSymbol {
-    fn set_atts(&self, node: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag) -> NodeResult {
+    fn set_atts(
+        &self,
+        node: &RsvgNode,
+        _: *const RsvgHandle,
+        pbag: &PropertyBag<'_>,
+    ) -> NodeResult {
         // symbol element has overflow:hidden
         // https://www.w3.org/TR/SVG/styling.html#UAStyleSheet
         node.set_overflow_hidden();
@@ -429,17 +455,4 @@ pub extern "C" fn rsvg_node_svg_get_size(
             (_, _, _) => false.to_glib(),
         },
     )
-}
-
-#[no_mangle]
-pub extern "C" fn rsvg_node_svg_apply_atts(raw_node: *const RsvgNode, handle: *const RsvgHandle) {
-    assert!(!raw_node.is_null());
-    let node: &RsvgNode = unsafe { &*raw_node };
-
-    node.with_impl(|svg: &NodeSvg| {
-        if let Some(owned_pbag) = svg.pbag.borrow().as_ref() {
-            let pbag = PropertyBag::from_owned(owned_pbag);
-            state::parse_style_attrs(handle, node, "svg", &pbag);
-        }
-    });
 }

@@ -30,13 +30,10 @@ pub enum EdgeMode {
 
 /// Extension methods for `cairo::ImageSurfaceData`.
 pub trait ImageSurfaceDataExt: DerefMut<Target = [u8]> {
-    /// Sets the pixel at the given coordinates.
+    /// Sets the pixel at the given coordinates. Assumes the `ARgb32` format.
     #[inline]
     fn set_pixel(&mut self, stride: usize, pixel: Pixel, x: u32, y: u32) {
-        let value = ((pixel.a as u32) << 24)
-            | ((pixel.r as u32) << 16)
-            | ((pixel.g as u32) << 8)
-            | (pixel.b as u32);
+        let value = pixel.to_u32();
         unsafe {
             *(&mut self[y as usize * stride + x as usize * 4] as *mut u8 as *mut u32) = value;
         }
@@ -51,7 +48,7 @@ impl Pixel {
             self
         } else {
             let alpha = f64::from(self.a) / 255.0;
-            let unpremultiply = |x| (f64::from(x) / alpha).round() as u8;
+            let unpremultiply = |x| ((f64::from(x) / alpha) + 0.5) as u8;
 
             Self {
                 r: unpremultiply(self.r),
@@ -66,7 +63,7 @@ impl Pixel {
     #[inline]
     pub fn premultiply(self) -> Self {
         let alpha = f64::from(self.a) / 255.0;
-        let premultiply = |x| (f64::from(x) * alpha).round() as u8;
+        let premultiply = |x| ((f64::from(x) * alpha) + 0.5) as u8;
 
         Self {
             r: premultiply(self.r),
@@ -75,6 +72,27 @@ impl Pixel {
             a: self.a,
         }
     }
+
+    /// Returns the pixel value as a `u32`, in the same format as `cairo::Format::ARgb32`.
+    #[inline]
+    pub fn to_u32(self) -> u32 {
+        (u32::from(self.a) << 24)
+            | (u32::from(self.r) << 16)
+            | (u32::from(self.g) << 8)
+            | u32::from(self.b)
+    }
+
+    /// Converts a `u32` in the same format as `cairo::Format::ARgb32` into a `Pixel`.
+    #[inline]
+    pub fn from_u32(x: u32) -> Self {
+        Self {
+            r: ((x >> 16) & 0xFF) as u8,
+            g: ((x >> 8) & 0xFF) as u8,
+            b: (x & 0xFF) as u8,
+            a: ((x >> 24) & 0xFF) as u8,
+        }
+    }
 }
 
 impl<'a> ImageSurfaceDataExt for cairo::ImageSurfaceData<'a> {}
+impl<'a> ImageSurfaceDataExt for &'a mut [u8] {}

@@ -1,23 +1,18 @@
 use cssparser::{self, Parser, Token};
-use glib::translate::*;
-use glib_sys;
-use libc;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::str::FromStr;
 
 use attributes::Attribute;
 use error::*;
-use handle::RsvgHandle;
+use font_props::{FontSizeSpec, FontWeightSpec, LetterSpacingSpec, SingleFontFamily};
 use iri::IRI;
-use length::{Dasharray, FontSizeSpec, Length, LengthDir, LengthUnit};
-use node::RsvgNode;
+use length::{Dasharray, Length, LengthDir, LengthUnit};
 use paint_server::PaintServer;
 use parsers::{Parse, ParseError};
 use property_bag::PropertyBag;
 use property_macros::Property;
 use unitinterval::UnitInterval;
-use util::utf8_cstr;
 
 /// Representation of a single CSS property value.
 ///
@@ -44,7 +39,7 @@ where
     T: Property<ComputedValues> + Clone + Default,
 {
     pub fn compute(&self, src: &T, src_values: &ComputedValues) -> T {
-        match *self {
+        let value: T = match *self {
             SpecifiedValue::Unspecified => {
                 if <T as Property<ComputedValues>>::inherits_automatically() {
                     src.clone()
@@ -55,8 +50,10 @@ where
 
             SpecifiedValue::Inherit => src.clone(),
 
-            SpecifiedValue::Specified(ref v) => v.compute(src_values),
-        }
+            SpecifiedValue::Specified(ref v) => v.clone(),
+        };
+
+        value.compute(src_values)
     }
 }
 
@@ -68,9 +65,6 @@ where
         SpecifiedValue::Unspecified
     }
 }
-
-// This is only used as *const RsvgState or *mut RsvgState, as an opaque pointer for C
-pub enum RsvgState {}
 
 /// Holds the state of CSS properties
 ///
@@ -143,7 +137,7 @@ pub struct SpecifiedValues {
     pub xml_space: SpecifiedValue<XmlSpace>, // not a property, but a non-presentation attribute
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct ComputedValues {
     pub baseline_shift: BaselineShift,
     pub clip_path: ClipPath,
@@ -219,62 +213,6 @@ impl ComputedValues {
     }
 }
 
-impl Default for ComputedValues {
-    fn default() -> ComputedValues {
-        ComputedValues {
-            // please keep these sorted
-            baseline_shift: Default::default(),
-            clip_path: Default::default(),
-            clip_rule: Default::default(),
-            color: Default::default(),
-            color_interpolation_filters: Default::default(),
-            comp_op: Default::default(),
-            direction: Default::default(),
-            display: Default::default(),
-            enable_background: Default::default(),
-            fill: Default::default(),
-            fill_opacity: Default::default(),
-            fill_rule: Default::default(),
-            filter: Default::default(),
-            flood_color: Default::default(),
-            flood_opacity: Default::default(),
-            font_family: Default::default(),
-            font_size: Default::default(),
-            font_stretch: Default::default(),
-            font_style: Default::default(),
-            font_variant: Default::default(),
-            font_weight: Default::default(),
-            letter_spacing: Default::default(),
-            lighting_color: Default::default(),
-            marker_end: Default::default(),
-            marker_mid: Default::default(),
-            marker_start: Default::default(),
-            mask: Default::default(),
-            opacity: Default::default(),
-            overflow: Default::default(),
-            shape_rendering: Default::default(),
-            stop_color: Default::default(),
-            stop_opacity: Default::default(),
-            stroke: Default::default(),
-            stroke_dasharray: Default::default(),
-            stroke_dashoffset: Default::default(),
-            stroke_line_cap: Default::default(),
-            stroke_line_join: Default::default(),
-            stroke_opacity: Default::default(),
-            stroke_miterlimit: Default::default(),
-            stroke_width: Default::default(),
-            text_anchor: Default::default(),
-            text_decoration: Default::default(),
-            text_rendering: Default::default(),
-            unicode_bidi: Default::default(),
-            visibility: Default::default(),
-            writing_mode: Default::default(),
-            xml_lang: Default::default(),
-            xml_space: Default::default(),
-        }
-    }
-}
-
 macro_rules! compute_value {
     ($self:ident, $computed:ident, $name:ident) => {
         $computed.$name = $self.$name.compute(&$computed.$name, &$computed)
@@ -343,30 +281,21 @@ impl SpecifiedValues {
 }
 
 impl State {
-    fn new() -> State {
+    pub fn new() -> State {
         State {
             values: Default::default(),
             important_styles: Default::default(),
         }
     }
 
-    fn parse_style_pair(
+    fn parse_attribute_pair(
         &mut self,
         attr: Attribute,
         value: &str,
-        important: bool,
         accept_shorthands: bool,
     ) -> Result<(), NodeError> {
-        if !important && self.important_styles.borrow().contains(&attr) {
-            return Ok(());
-        }
-
-        if important {
-            self.important_styles.borrow_mut().insert(attr);
-        }
-
         // FIXME: move this to "do catch" when we can bump the rustc version dependency
-        let mut parse = || -> Result<(), AttributeError> {
+        let mut parse = || -> Result<(), ValueErrorKind> {
             // please keep these sorted
             match attr {
                 Attribute::BaselineShift => {
@@ -454,7 +383,7 @@ impl State {
                 }
 
                 Attribute::LetterSpacing => {
-                    self.values.letter_spacing = parse_property(value, LengthDir::Horizontal)?;
+                    self.values.letter_spacing = parse_property(value, ())?;
                 }
 
                 Attribute::LightingColor => {
@@ -587,22 +516,51 @@ impl State {
         // https://www.w3.org/TR/CSS2/syndata.html#unsupported-values
         // Ignore unsupported / illegal values; don't set the whole
         // node to be in error in that case.
+
+        if let Err(e) = parse().map_err(|e| NodeError::attribute_error(attr, e)) {
+            rsvg_log!(
+                "(style property error for attribute {:?}\n    value=\"{}\"\n    {}\n    property \
+                 will be ignored)",
+                attr,
+                value,
+                e
+            );
+        }
+
+        // If we didn't ignore property errors, we could just return this:
         // parse().map_err(|e| NodeError::attribute_error(attr, e))
-
-        let _ = parse();
-
         Ok(())
     }
 
-    fn parse_presentation_attributes(&mut self, pbag: &PropertyBag) -> Result<(), NodeError> {
+    pub fn parse_presentation_attributes(
+        &mut self,
+        pbag: &PropertyBag<'_>,
+    ) -> Result<(), NodeError> {
         for (_key, attr, value) in pbag.iter() {
-            self.parse_style_pair(attr, value, false, false)?;
+            self.parse_attribute_pair(attr, value, false)?;
         }
 
         Ok(())
     }
 
-    fn parse_style_declarations(&mut self, declarations: &str) -> Result<(), NodeError> {
+    pub fn parse_style_pair(
+        &mut self,
+        attr: Attribute,
+        value: &str,
+        important: bool,
+    ) -> Result<(), NodeError> {
+        if !important && self.important_styles.borrow().contains(&attr) {
+            return Ok(());
+        }
+
+        if important {
+            self.important_styles.borrow_mut().insert(attr);
+        }
+
+        self.parse_attribute_pair(attr, value, true)
+    }
+
+    pub fn parse_style_declarations(&mut self, declarations: &str) -> Result<(), NodeError> {
         // Split an attribute value like style="foo: bar; baz: beep;" into
         // individual CSS declarations ("foo: bar" and "baz: beep") and
         // set them onto the state struct.
@@ -618,11 +576,6 @@ impl State {
                 let value = value[1..].trim();
 
                 if !prop_name.is_empty() && !value.is_empty() {
-                    // Just remove single quotes in a trivial way.  No handling for any
-                    // special character inside the quotes is done.  This relates
-                    // especially to font-family names.
-                    let value = value.replace('\'', "");
-
                     let mut important = false;
 
                     let value = if let Some(bang_pos) = value.find('!') {
@@ -638,7 +591,7 @@ impl State {
                     };
 
                     if let Ok(attr) = Attribute::from_str(prop_name) {
-                        self.parse_style_pair(attr, value, important, true)?;
+                        self.parse_style_pair(attr, value, important)?;
                     }
                     // else unknown property name; ignore
                 }
@@ -701,15 +654,15 @@ make_property!(
     parse_impl: {
         impl Parse for BaselineShift {
             type Data = ();
-            type Err = AttributeError;
+            type Err = ValueErrorKind;
 
             // These values come from Inkscape's SP_CSS_BASELINE_SHIFT_(SUB/SUPER/BASELINE);
             // see sp_style_merge_baseline_shift_from_parent()
-            fn parse(parser: &mut Parser, _: Self::Data) -> Result<BaselineShift, ::error::AttributeError> {
+            fn parse(parser: &mut Parser<'_, '_>, _: Self::Data) -> Result<BaselineShift, ::error::ValueErrorKind> {
                 let parser_state = parser.state();
 
                 {
-                    let token = parser.next().map_err(|_| ::error::AttributeError::Parse(
+                    let token = parser.next().map_err(|_| ::error::ValueErrorKind::Parse(
                         ::parsers::ParseError::new("expected token"),
                     ))?;
 
@@ -942,9 +895,9 @@ make_property!(
 make_property!(
     ComputedValues,
     FontFamily,
-    default: "Times New Roman".to_string(),
+    default: SingleFontFamily("Times New Roman".to_string()),
     inherits_automatically: true,
-    newtype_parse: String,
+    newtype_parse: SingleFontFamily,
     parse_data_type: ()
 );
 
@@ -1014,37 +967,34 @@ make_property!(
     "small-caps" => SmallCaps,
 );
 
-// https://www.w3.org/TR/SVG/text.html#FontWeightProperty
+// https://www.w3.org/TR/2008/REC-CSS2-20080411/fonts.html#propdef-font-weight
 make_property!(
     ComputedValues,
     FontWeight,
-    default: Normal,
+    default: FontWeightSpec::Normal,
     inherits_automatically: true,
-
-    identifiers:
-    "normal" => Normal,
-    "bold" => Bold,
-    "bolder" => Bolder,
-    "lighter" => Lighter,
-    "100" => W100, // FIXME: we should use Weight(100),
-    "200" => W200, // but we need a smarter macro for that
-    "300" => W300,
-    "400" => W400,
-    "500" => W500,
-    "600" => W600,
-    "700" => W700,
-    "800" => W800,
-    "900" => W900,
+    newtype_parse: FontWeightSpec,
+    parse_data_type: ()
 );
 
 // https://www.w3.org/TR/SVG/text.html#LetterSpacingProperty
 make_property!(
     ComputedValues,
     LetterSpacing,
-    default: Length::default(),
-    inherits_automatically: true,
-    newtype_parse: Length,
-    parse_data_type: LengthDir
+    default: LetterSpacingSpec::Normal,
+    newtype_parse: LetterSpacingSpec,
+    parse_data_type: (),
+    property_impl: {
+        impl Property<ComputedValues> for LetterSpacing {
+            fn inherits_automatically() -> bool {
+                true
+            }
+
+            fn compute(&self, _v: &ComputedValues) -> Self {
+                LetterSpacing(self.0.compute())
+            }
+        }
+    }
 );
 
 // https://www.w3.org/TR/SVG/filters.html#LightingColorProperty
@@ -1269,9 +1219,9 @@ make_property!(
     parse_impl: {
         impl Parse for TextDecoration {
             type Data = ();
-            type Err = AttributeError;
+            type Err = ValueErrorKind;
 
-            fn parse(parser: &mut Parser, _: Self::Data) -> Result<TextDecoration, AttributeError> {
+            fn parse(parser: &mut Parser<'_, '_>, _: Self::Data) -> Result<TextDecoration, ValueErrorKind> {
                 let mut overline = false;
                 let mut underline = false;
                 let mut strike = false;
@@ -1281,7 +1231,7 @@ make_property!(
                 }
 
                 while !parser.is_exhausted() {
-                    let cow = parser.expect_ident().map_err(|_| ::error::AttributeError::Parse(
+                    let cow = parser.expect_ident().map_err(|_| ::error::ValueErrorKind::Parse(
                         ::parsers::ParseError::new("expected identifier"),
                     ))?;
 
@@ -1289,7 +1239,7 @@ make_property!(
                         "overline" => overline = true,
                         "underline" => underline = true,
                         "line-through" => strike = true,
-                        _ => return Err(AttributeError::Parse(ParseError::new("invalid syntax"))),
+                        _ => return Err(ValueErrorKind::Parse(ParseError::new("invalid syntax"))),
                     }
                 }
 
@@ -1429,182 +1379,3 @@ make_property!(
     "default" => Default,
     "preserve" => Preserve,
 );
-
-pub fn from_c<'a>(state: *const RsvgState) -> &'a State {
-    assert!(!state.is_null());
-
-    unsafe { &*(state as *const State) }
-}
-
-pub fn from_c_mut<'a>(state: *mut RsvgState) -> &'a mut State {
-    assert!(!state.is_null());
-
-    unsafe { &mut *(state as *mut State) }
-}
-
-pub fn to_c_mut(state: &mut State) -> *mut RsvgState {
-    state as *mut State as *mut RsvgState
-}
-
-// Rust State API for consumption from C ----------------------------------------
-
-#[no_mangle]
-pub extern "C" fn rsvg_state_new() -> *mut RsvgState {
-    Box::into_raw(Box::new(State::new())) as *mut RsvgState
-}
-
-#[no_mangle]
-pub extern "C" fn rsvg_state_free(state: *mut RsvgState) {
-    let state = from_c_mut(state);
-
-    unsafe {
-        Box::from_raw(state);
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn rsvg_state_parse_style_pair(
-    state: *mut RsvgState,
-    attr: Attribute,
-    value: *const libc::c_char,
-    important: glib_sys::gboolean,
-    accept_shorthands: glib_sys::gboolean,
-) -> glib_sys::gboolean {
-    let state = from_c_mut(state);
-
-    assert!(!value.is_null());
-
-    let value = unsafe { utf8_cstr(value) };
-
-    match state.parse_style_pair(
-        attr,
-        value,
-        from_glib(important),
-        from_glib(accept_shorthands),
-    ) {
-        Ok(_) => true.to_glib(),
-        Err(_) => false.to_glib(),
-    }
-}
-
-extern "C" {
-    fn rsvg_lookup_apply_css_style(
-        handle: *const RsvgHandle,
-        target: *const libc::c_char,
-        state: *mut RsvgState,
-    ) -> glib_sys::gboolean;
-}
-
-// Sets the node's state from the attributes in the pbag.  Also
-// applies CSS rules in our limited way based on the node's
-// tag/klazz/id.
-pub fn parse_style_attrs(
-    handle: *const RsvgHandle,
-    node: &RsvgNode,
-    tag: &str,
-    pbag: &PropertyBag,
-) {
-    let state = node.get_state_mut();
-
-    match state.parse_presentation_attributes(pbag) {
-        Ok(_) => (),
-        Err(_) => (),
-        /* FIXME: we'll ignore errors here for now.  If we return, we expose
-         * buggy handling of the enable-background property; we are not parsing it correctly.
-         * This causes tests/fixtures/reftests/bugs/587721-text-transform.svg to fail
-         * because it has enable-background="new 0 0 1179.75118 687.74173" in the toplevel svg
-         * element.
-         *        Err(e) => (),
-         *        {
-         *            node.set_error(e);
-         *            return;
-         *        } */
-    }
-
-    // Try to properly support all of the following, including inheritance:
-    // *
-    // #id
-    // tag
-    // tag#id
-    // tag.class
-    // tag.class#id
-    //
-    // This is basically a semi-compliant CSS2 selection engine
-
-    unsafe {
-        // *
-        rsvg_lookup_apply_css_style(handle, "*".to_glib_none().0, to_c_mut(state));
-
-        // tag
-        rsvg_lookup_apply_css_style(handle, tag.to_glib_none().0, to_c_mut(state));
-
-        if let Some(klazz) = node.get_class() {
-            for cls in klazz.split_whitespace() {
-                let mut found = false;
-
-                if !cls.is_empty() {
-                    // tag.class#id
-                    if let Some(id) = node.get_id() {
-                        let target = format!("{}.{}#{}", tag, cls, id);
-                        found = found || from_glib(rsvg_lookup_apply_css_style(
-                            handle,
-                            target.to_glib_none().0,
-                            to_c_mut(state),
-                        ));
-                    }
-
-                    // .class#id
-                    if let Some(id) = node.get_id() {
-                        let target = format!(".{}#{}", cls, id);
-                        found = found || from_glib(rsvg_lookup_apply_css_style(
-                            handle,
-                            target.to_glib_none().0,
-                            to_c_mut(state),
-                        ));
-                    }
-
-                    // tag.class
-                    let target = format!("{}.{}", tag, cls);
-                    found = found || from_glib(rsvg_lookup_apply_css_style(
-                        handle,
-                        target.to_glib_none().0,
-                        to_c_mut(state),
-                    ));
-
-                    if !found {
-                        // didn't find anything more specific, just apply the class style
-                        let target = format!(".{}", cls);
-                        rsvg_lookup_apply_css_style(
-                            handle,
-                            target.to_glib_none().0,
-                            to_c_mut(state),
-                        );
-                    }
-                }
-            }
-        }
-
-        if let Some(id) = node.get_id() {
-            // id
-            let target = format!("#{}", id);
-            rsvg_lookup_apply_css_style(handle, target.to_glib_none().0, to_c_mut(state));
-
-            // tag#id
-            let target = format!("{}#{}", tag, id);
-            rsvg_lookup_apply_css_style(handle, target.to_glib_none().0, to_c_mut(state));
-        }
-
-        for (_key, attr, value) in pbag.iter() {
-            match attr {
-                Attribute::Style => {
-                    if let Err(e) = state.parse_style_declarations(value) {
-                        node.set_error(e);
-                        break;
-                    }
-                }
-
-                _ => (),
-            }
-        }
-    }
-}

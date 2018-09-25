@@ -51,7 +51,7 @@ impl NodeTrait for DisplacementMap {
         &self,
         node: &RsvgNode,
         handle: *const RsvgHandle,
-        pbag: &PropertyBag,
+        pbag: &PropertyBag<'_>,
     ) -> NodeResult {
         self.base.set_atts(node, handle, pbag)?;
 
@@ -60,9 +60,9 @@ impl NodeTrait for DisplacementMap {
                 Attribute::In2 => {
                     self.in2.replace(Some(Input::parse(Attribute::In2, value)?));
                 }
-                Attribute::Scale => self
-                    .scale
-                    .set(parsers::number(value).map_err(|err| NodeError::parse_error(attr, err))?),
+                Attribute::Scale => self.scale.set(
+                    parsers::number(value).map_err(|err| NodeError::attribute_error(attr, err))?,
+                ),
                 Attribute::XChannelSelector => self
                     .x_channel_selector
                     .set(ColorChannel::parse(attr, value)?),
@@ -82,7 +82,7 @@ impl Filter for DisplacementMap {
         &self,
         _node: &RsvgNode,
         ctx: &FilterContext,
-        draw_ctx: &mut DrawingCtx,
+        draw_ctx: &mut DrawingCtx<'_>,
     ) -> Result<FilterResult, FilterError> {
         let input = self.base.get_input(ctx, draw_ctx)?;
         let displacement_input = ctx.get_input(draw_ctx, self.in2.borrow().as_ref())?;

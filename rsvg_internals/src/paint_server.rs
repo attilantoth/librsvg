@@ -21,9 +21,9 @@ pub enum PaintServer {
 
 impl Parse for PaintServer {
     type Data = ();
-    type Err = AttributeError;
+    type Err = ValueErrorKind;
 
-    fn parse(parser: &mut Parser, _: ()) -> Result<PaintServer, AttributeError> {
+    fn parse(parser: &mut Parser<'_, '_>, _: ()) -> Result<PaintServer, ValueErrorKind> {
         if parser.try(|i| i.expect_ident_matching("none")).is_ok() {
             Ok(PaintServer::None)
         } else if let Ok(url) = parser.try(|i| i.expect_url()) {
@@ -44,13 +44,13 @@ impl Parse for PaintServer {
         } else {
             cssparser::Color::parse(parser)
                 .map(PaintServer::SolidColor)
-                .map_err(AttributeError::from)
+                .map_err(ValueErrorKind::from)
         }
     }
 }
 
 fn set_color(
-    draw_ctx: &mut DrawingCtx,
+    draw_ctx: &mut DrawingCtx<'_>,
     color: &cssparser::Color,
     opacity: &UnitInterval,
     current_color: &cssparser::RGBA,
@@ -70,12 +70,12 @@ fn set_color(
 }
 
 pub fn set_source_paint_server(
-    draw_ctx: &mut DrawingCtx,
+    draw_ctx: &mut DrawingCtx<'_>,
     ps: &PaintServer,
     opacity: &UnitInterval,
     bbox: &BoundingBox,
     current_color: &cssparser::RGBA,
-) -> bool {
+) -> Result<bool, RenderingError> {
     let mut had_paint_server;
 
     match *ps {
@@ -96,7 +96,7 @@ pub fn set_source_paint_server(
                     );
                 } else if node.get_type() == NodeType::Pattern {
                     had_paint_server =
-                        pattern::pattern_resolve_fallbacks_and_set_pattern(&node, draw_ctx, bbox);
+                        pattern::pattern_resolve_fallbacks_and_set_pattern(&node, draw_ctx, bbox)?;
                 }
             }
 
@@ -121,7 +121,7 @@ pub fn set_source_paint_server(
         }
     };
 
-    had_paint_server
+    Ok(had_paint_server)
 }
 
 #[cfg(test)]

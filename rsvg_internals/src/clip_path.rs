@@ -5,6 +5,7 @@ use cairo::{self, MatrixTrait};
 use attributes::Attribute;
 use coord_units::CoordUnits;
 use drawing_ctx::DrawingCtx;
+use error::RenderingError;
 use handle::RsvgHandle;
 use node::{NodeResult, NodeTrait, RsvgNode};
 use parsers::parse;
@@ -31,8 +32,8 @@ impl NodeClipPath {
         &self,
         node: &RsvgNode,
         affine_before_clip: &cairo::Matrix,
-        draw_ctx: &mut DrawingCtx,
-    ) {
+        draw_ctx: &mut DrawingCtx<'_>,
+    ) -> Result<(), RenderingError> {
         let cascaded = node.get_cascaded_values();
 
         let clip_units = self.units.get();
@@ -43,7 +44,7 @@ impl NodeClipPath {
             if orig_bbox.rect.is_none() {
                 // The node being clipped is empty / doesn't have a
                 // bounding box, so there's nothing to clip!
-                return;
+                return Ok(());
             }
 
             let rect = orig_bbox.rect.unwrap();
@@ -60,7 +61,7 @@ impl NodeClipPath {
         cr.set_matrix(child_matrix);
 
         // here we don't push a layer because we are clipping
-        node.draw_children(&cascaded, draw_ctx, true);
+        let res = node.draw_children(&cascaded, draw_ctx, true);
 
         cr.set_matrix(save_affine);
 
@@ -72,11 +73,13 @@ impl NodeClipPath {
 
         let cr = draw_ctx.get_cairo_context();
         cr.clip();
+
+        res
     }
 }
 
 impl NodeTrait for NodeClipPath {
-    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag) -> NodeResult {
+    fn set_atts(&self, _: &RsvgNode, _: *const RsvgHandle, pbag: &PropertyBag<'_>) -> NodeResult {
         for (_key, attr, value) in pbag.iter() {
             match attr {
                 Attribute::ClipPathUnits => self.units.set(parse("clipPathUnits", value, ())?),
