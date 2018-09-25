@@ -1662,7 +1662,8 @@ rsvg_cairo_surface_new_from_href (RsvgHandle *handle,
         return NULL;
 
     if (mime_type) {
-        loader = gdk_pixbuf_loader_new_with_mime_type (mime_type, error);
+//        loader = gdk_pixbuf_loader_new_with_mime_type (mime_type, error);
+        loader = gdk_pixbuf_loader_new ();
     } else {
         loader = gdk_pixbuf_loader_new ();
     }
